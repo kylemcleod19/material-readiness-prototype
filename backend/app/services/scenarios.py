@@ -58,9 +58,11 @@ def create(db: Session, actor: Actor, po_line_id: str, op_id=None) -> dict:
         return {"scenario_id": existing.id}
     line = get_or_404(db, PurchaseOrderLine, po_line_id)
     claims = list(db.scalars(_claims_q(line.id)))
-    if not any(c.review_required for c in claims):
-        raise DomainError("This PO line has no allocation review to resolve")
     pool = list(db.scalars(_pool_q(line.id)))
+    shortage = any(c.review_required for c in claims)
+    received = any(r.quality_state == "accepted" for r in pool)
+    if not claims or not (shortage or received):
+        raise DomainError("This PO line has no allocation decision to make")
     by_item: dict[str, int] = defaultdict(int)
     for c in claims:
         by_item[c.work_order_item_id] += c.qty
@@ -70,9 +72,11 @@ def create(db: Session, actor: Actor, po_line_id: str, op_id=None) -> dict:
     db.add(sc)
     db.flush()
     for item_id, claimed in by_item.items():
-        # Start from the existing claims so the infeasibility is visible before any edit.
+        # A shortage starts from the existing allocations so the infeasibility is visible before any edit;
+        # received material starts with everything still on order, for the planner to assign.
         db.add(ScenarioAllocation(id=new_id("sca"), scenario_id=sc.id, work_order_item_id=item_id,
-                                  available_qty=claimed, incoming_qty=0, claimed_qty=claimed))
+                                  available_qty=claimed if shortage else 0, incoming_qty=0 if shortage else claimed,
+                                  claimed_qty=claimed))
     db.flush()
     history.record(db, actor, sc, "scenario.create", after={"po_line_id": line.id}, op_id=op_id)
     return {"scenario_id": sc.id}
@@ -179,6 +183,9 @@ def preview(db: Session, scenario_id: str) -> dict:
         "description": part.description, "supplier": snap.suppliers[po.supplier_id].name, "uom": part.uom,
         "owner": sc.owner, "warehouse": snap.warehouses[po.destination_warehouse_id].name,
         "supply": {"available": q.pooled_accepted, "incoming": q.incoming, "allocated": q.claims, "short": q.deficit},
+        "kind": "shortage" if q.deficit or any(a.review for a in snap.allocs if a.source_type == "po_line" and a.source_id == line.id) else "received",
+        "issues": [{"id": e.id, "type": e.type, "title": e.title} for e in {e.id: e for p in props
+                   for e in snap.exceptions_by_item.get(p.work_order_item_id, []) if e.state != "closed"}.values()],
         "proposed": {"available": sum(p.available_qty for p in props), "incoming": sum(p.incoming_qty for p in props)},
         "rows": rows,
     }
@@ -189,7 +196,9 @@ def _item_brief(ir) -> dict:
             "staged": ir.staged, "timing": ir.timing, "state": ir.state}
 
 
-def apply(db: Session, actor: Actor, scenario_id: str, op_id=None) -> dict:
+def apply(db: Session, actor: Actor, scenario_id: str, op_id=None, close_issue_ids: list[str] | None = None) -> dict:
+    """Commit the plan atomically. close_issue_ids records the related issue reviews as done in the same
+    transaction; unresolved shortages stay visible on the work orders regardless."""
     sc = lock(db, PlanningScenario, scenario_id)
     if sc.state != "draft":
         raise Conflict(f"Scenario already {sc.state}")
@@ -245,7 +254,11 @@ def apply(db: Session, actor: Actor, scenario_id: str, op_id=None) -> dict:
                         .where(MaterialExceptionLink.work_order_item_id.in_(item_ids),
                                MaterialException.state != "closed").distinct()).all()
     for exc in linked:
-        exc_service.append_note(db, actor, exc, f"Allocation plan applied ({sc.id}) by {actor.name}.", op_id)
+        note = f"Allocation plan applied ({sc.id}) by {actor.name}."
+        if exc.id in (close_issue_ids or []):
+            exc_service.close(db, actor, exc.id, note, op_id)
+        else:
+            exc_service.append_note(db, actor, exc, note, op_id)
     return {"scenario_id": sc.id, "state": sc.state}
 
 

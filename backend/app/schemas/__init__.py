@@ -199,3 +199,65 @@ class SupplierEvent(Op):
     carrier: str | None = None
     tracking_number: str | None = None
     status: str | None = None
+
+
+class ScenarioApply(QtyOp):
+    close_issue_ids: list[str] = []
+
+
+class HoldRelease(BaseModel):
+    allocation_id: str
+    qty: int | None = Field(default=None, gt=0)
+
+
+class TransferChoice(BaseModel):
+    allocation_id: str | None = None
+    work_order_item_id: str | None = None
+    inventory_record_id: str | None = None
+    qty: int | None = Field(default=None, gt=0)
+    expected_arrival: dt.date | None = None
+
+
+class AssignmentChoice(BaseModel):
+    work_order_item_id: str
+    source_type: str
+    source_id: str
+    qty: int = Field(gt=0)
+
+
+class PurchaseChoice(BaseModel):
+    supplier_id: str | None = None
+    expected_arrival: dt.date | None = None
+    general_stock: int = Field(default=0, ge=0)
+    allocations: list[POAllocationIn] = []
+
+
+class SourcingApply(QtyOp):
+    """One confirmed Source material decision for a part at one destination."""
+
+    part_id: str
+    warehouse_id: str
+    release_holds: list[HoldRelease] = []
+    transfers: list[TransferChoice] = []
+    assignments: list[AssignmentChoice] = []
+    purchase: PurchaseChoice | None = None
+
+
+class ArrivalChange(BaseModel):
+    target_type: str
+    target_id: str
+    expected_arrival: dt.date | None
+    basis: str = "supplier_promise"
+
+
+class NextCheckIn(BaseModel):
+    due_date: dt.date
+    note: str | None = None
+
+
+class SupplierUpdate(Op):
+    note: str = Field(min_length=1)
+    arrivals: list[ArrivalChange] = []
+    complete_checkin_ids: list[str] = []
+    next_checkin: NextCheckIn | None = None
+    mark_reviewed: bool = False

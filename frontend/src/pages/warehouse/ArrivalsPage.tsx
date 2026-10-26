@@ -32,7 +32,7 @@ function toRows(d: WarehouseQueue, wh: string): Row[] {
 }
 
 const STATUS: Record<string, { tone: "amber" | "blue" | "neutral" | "violet"; label: string }> = {
-  arrived: { tone: "amber", label: "At dock" },
+  arrived: { tone: "amber", label: "Awaiting receipt" },
   in_transit: { tone: "blue", label: "In transit" },
   unshipped: { tone: "neutral", label: "Not shipped" },
   planned: { tone: "violet", label: "Transfer planned" },

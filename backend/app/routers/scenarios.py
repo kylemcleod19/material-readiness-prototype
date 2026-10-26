@@ -30,8 +30,9 @@ def update(scenario_id: str, body: schemas.ScenarioUpdate, db: Session = Depends
 
 
 @router.post("/scenarios/{scenario_id}/apply")
-def apply(scenario_id: str, body: schemas.QtyOp, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
-    return run_action(db, body.op_id, "scenario.apply", lambda: svc.apply(db, actor, scenario_id, body.op_id))
+def apply(scenario_id: str, body: schemas.ScenarioApply, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    return run_action(db, body.op_id, "scenario.apply",
+                      lambda: svc.apply(db, actor, scenario_id, body.op_id, body.close_issue_ids))
 
 
 @router.post("/scenarios/{scenario_id}/discard")

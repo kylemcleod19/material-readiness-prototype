@@ -125,7 +125,8 @@ class Snapshot:
             shortfall=line.closed_shortfall_qty,
             expected_arrival=line.expected_arrival,
             received=self.received_by_line.get(line_id, 0),
-            open_shipments=[(q, eta, label) for q, eta, label, _ in self.open_shipments(line_id)],
+            open_shipments=[(q, eta, label, sh_id, self.shipments[sh_id].status == "arrived")
+                            for q, eta, label, sh_id in self.open_shipments(line_id)],
             pooled=[(r.qty, r.quality_state) for r in self.pooled_by_line.get(line_id, [])
                     if r.quality_state == "pending" or (r.quality_state == "accepted" and line_id not in cleared_pools)],
             claims=sum(a.qty for a in allocs if a.source_type == "po_line" and a.source_id == line_id),
@@ -180,7 +181,9 @@ class ItemReadiness:
     late_qty: int = 0
     # Latest known expected arrival across on-order sources (None when nothing is on order or dates are unknown).
     expected: date | None = None
-    # One status and next action, see _item_state.
+    # Every applicable situation (primary first), and the primary one's kind and action. See _situations.
+    situations: list[dict] = field(default_factory=list)
+    situation: dict | None = None
     state: str = "short"
     action: dict | None = None
     sources: list[SourceLine] = field(default_factory=list)
@@ -241,13 +244,16 @@ def compute(snap: Snapshot, allocs: list[AllocView] | None = None,
             elif src.category == "picked":
                 ir.picked += a.qty
 
+    stages = _line_stages(snap, allocs, lq)
     for ir in items.values():
         ir.uncovered = max(0, ir.required - ir.allocated)
         incoming = [s for s in ir.sources if s.category == "incoming"]
         ir.timing = worst_timing(s.timing for s in incoming)
         ir.late_qty = sum(s.late_qty for s in incoming)
         ir.expected = max((s.expected_arrival for s in incoming if s.expected_arrival), default=None)
-        ir.state, ir.action = _item_state(ir, snap.work_orders[ir.work_order_id])
+        ir.situations = _situations(snap, ir, snap.work_orders[ir.work_order_id], lq, stages)
+        ir.situation = ir.situations[0] if ir.situations else _sit("short", ir.required)
+        ir.state, ir.action = ir.situation["kind"], ir.situation["action"]
     return Readiness(snap, allocs, items, lq)
 
 
@@ -298,100 +304,196 @@ def _source_line(snap: Snapshot, a: AllocView, lq: dict[str, LineQuantities],
     return src
 
 
-# ---------------------------------------------------------------- requirement status and next action
+# ---------------------------------------------------------------- situations and next actions (PRD §5.4)
 
-# Precedence: the first matching state is the requirement's one status.
-ITEM_STATES = ["short", "decision_needed", "transfer_decision", "arrives_late", "arrival_unknown",
-               "on_order", "ready_to_stage", "staged"]
+# Default precedence for the one primary situation shown per requirement. It selects the summary only;
+# every applicable situation stays in the list for expanded detail.
+SITUATION_ORDER = [
+    "allocation_decision", "short", "stock_at_other_site", "arrives_late", "arrival_unknown",
+    "awaiting_receipt", "awaiting_qa", "on_order", "transfer_in_transit", "ready_to_stage", "staged",
+]
 
 
-def _item_state(ir: "ItemReadiness", wo: WorkOrder) -> tuple[str, dict | None]:
-    """One status and one next action per requirement, so screens never need a column per bucket."""
+@dataclass
+class LineStage:
+    """Where a PO line's remaining supply physically is, relative to the allocations on it."""
+
+    claims: int
+    claim_count: int
+    awaiting_qa: int
+    qa_batch_id: str | None
+    at_dock: int
+    dock_shipment_id: str | None
+    received_unassigned: int
+
+
+def _line_stages(snap: Snapshot, allocs: list[AllocView], lq: dict[str, LineQuantities]) -> dict[str, LineStage]:
+    out = {}
+    for lid, q in lq.items():
+        claims = [a for a in allocs if a.source_type == "po_line" and a.source_id == lid and a.state == "committed"]
+        dock = [b for b in q.buckets if b.stage == "awaiting_receipt"]
+        batch = next((r.qa_batch_id for r in snap.pooled_by_line.get(lid, []) if r.quality_state == "pending"), None)
+        out[lid] = LineStage(q.claims, len(claims), q.pooled_pending, batch, sum(b.qty for b in dock),
+                             dock[0].shipment_id if dock else None, q.pooled_accepted)
+    return out
+
+
+def _sit(kind: str, qty: int, action: dict | None = None, date_: date | None = None, detail: str | None = None) -> dict:
+    return {"kind": kind, "qty": qty, "date": date_, "detail": detail, "action": action}
+
+
+def _update_action(line, bucket) -> dict:
+    """Record supplier update, preselecting the shipment or unshipped PO line the problem belongs to."""
+    if bucket is not None and bucket.shipment_id:
+        return {"kind": "record_supplier_update", "po_id": line.po_id, "target_type": "shipment",
+                "target_id": bucket.shipment_id}
+    return {"kind": "record_supplier_update", "po_id": line.po_id, "target_type": "po_line", "target_id": line.id}
+
+
+def _situations(snap: Snapshot, ir: "ItemReadiness", wo: WorkOrder, lq: dict[str, LineQuantities],
+                stages: dict[str, LineStage]) -> list[dict]:
+    """Every situation that applies to a requirement, primary first.
+
+    Physical stage, allocation, and timing are separate facts: a requirement can be fully allocated and
+    still arrive late. Received quantities never report late or unknown from an obsolete estimate.
+    """
     if wo.state != "finalized":
-        return ("not_reserved" if wo.state == "draft" else "canceled"), None
+        return [_sit("not_reserved" if wo.state == "draft" else "canceled", ir.required)]
+    sits: list[dict] = []
+    source_action = {"kind": "source_material", "part_id": ir.part_id, "warehouse_id": wo.warehouse_id,
+                     "item_id": ir.item_id}
+    for s in ir.sources:
+        if s.category in ("review", "blocked"):
+            sits.append(_sit("allocation_decision", s.qty, {"kind": "allocate_material", "po_line_id": s.source_id},
+                             detail="shortage"))
     if ir.uncovered:
-        return "short", {"kind": "buy", "qty": ir.uncovered}
-    if ir.review:
-        src = next((s for s in ir.sources if s.category in ("review", "blocked")), None)
-        return "decision_needed", {"kind": "resolve_shortage", "qty": ir.review,
-                                   "po_line_id": src.source_id if src and src.source_type == "po_line" else None}
+        sits.append(_sit("short", ir.uncovered, source_action))
     if ir.remote_hold:
         src = next(s for s in ir.sources if s.category == "remote_hold")
-        return "transfer_decision", {"kind": "decide_transfer", "qty": ir.remote_hold, "allocation_id": src.allocation_id,
-                                     "from_warehouse": src.warehouse}
-    incoming = [s for s in ir.sources if s.category == "incoming"]
-    late = next((s for s in incoming if s.timing in ("late", "timing_review")), None)
-    if late:
-        return "arrives_late", {"kind": "update_arrival", "qty": ir.late_qty, "po_id": late.po_id}
-    unknown = next((s for s in incoming if s.timing == "unknown"), None)
-    if unknown:
-        return "arrival_unknown", {"kind": "get_arrival_date", "qty": unknown.qty, "po_id": unknown.po_id}
-    if ir.incoming:
-        return "on_order", None
-    if ir.staged < ir.required:
-        return "ready_to_stage", {"kind": "pick_stage", "qty": ir.required - ir.staged}
-    return "staged", None
+        sits.append(_sit("stock_at_other_site", ir.remote_hold, source_action,
+                         detail=snap.warehouses[src.warehouse].name if src.warehouse else None))
+    for s in ir.sources:
+        if s.category != "incoming":
+            continue
+        if s.source_type == "transfer_line":
+            t = snap.transfers[s.source_id]
+            sits.append(_sit("transfer_in_transit", s.qty, None, t.expected_arrival,
+                             "after production start" if s.timing == "late" else None))
+            continue
+        st = stages[s.source_id]
+        line = snap.lines[s.source_id]
+        if st.received_unassigned and st.claim_count > 1:
+            sits.append(_sit("allocation_decision", st.received_unassigned,
+                             {"kind": "allocate_material", "po_line_id": s.source_id}, detail="received"))
+        if st.awaiting_qa and st.awaiting_qa >= st.claims:
+            sits.append(_sit("awaiting_qa", s.qty, {"kind": "inspect", "qa_batch_id": st.qa_batch_id}))
+            continue
+        if st.at_dock and st.at_dock + st.awaiting_qa >= st.claims:
+            sits.append(_sit("awaiting_receipt", s.qty, {"kind": "receive", "shipment_id": st.dock_shipment_id,
+                                                          "warehouse_id": wo.warehouse_id}))
+            continue
+        # Part of the line has physically arrived but not enough for every allocation: keep it as detail.
+        if st.awaiting_qa:
+            sits.append(_sit("awaiting_qa", min(s.qty, st.awaiting_qa), {"kind": "inspect", "qa_batch_id": st.qa_batch_id},
+                             detail="shared with other work orders" if st.claim_count > 1 else None))
+        if st.at_dock:
+            sits.append(_sit("awaiting_receipt", min(s.qty, st.at_dock),
+                             {"kind": "receive", "shipment_id": st.dock_shipment_id, "warehouse_id": wo.warehouse_id}))
+        buckets = [b for b in lq[s.source_id].buckets if not b.arrived]
+        if s.timing in ("late", "timing_review"):
+            late = next((b for b in buckets if b.eta is not None and b.eta > wo.production_start_date), None)
+            sits.append(_sit("arrives_late", s.late_qty, _update_action(line, late), late.eta if late else None,
+                             "shared timing review" if s.timing == "timing_review" else None))
+            if s.qty > s.late_qty:
+                sits.append(_sit("on_order", s.qty - s.late_qty, None, s.expected_arrival))
+        elif s.timing == "unknown":
+            unknown = next((b for b in buckets if b.eta is None), None)
+            sits.append(_sit("arrival_unknown", s.qty, _update_action(line, unknown)))
+        else:
+            sits.append(_sit("on_order", s.qty, None, s.expected_arrival,
+                             "multiple arrivals" if s.expected_arrival is None and buckets else None))
+    unstaged = ir.available - ir.staged
+    if unstaged > 0:
+        sits.append(_sit("ready_to_stage", unstaged, {"kind": "pick_and_stage", "work_order_id": wo.id}))
+    if ir.staged:
+        sits.append(_sit("staged", ir.staged))
+    merged: dict[tuple, dict] = {}
+    for s in sits:
+        a = s["action"] or {}
+        key = (s["kind"], s["detail"], a.get("po_line_id") or a.get("target_id"))
+        if key in merged:
+            merged[key]["qty"] += s["qty"]
+        else:
+            merged[key] = s
+    return sorted(merged.values(), key=lambda s: SITUATION_ORDER.index(s["kind"]))
 
 
 # ---------------------------------------------------------------- work-order level
 
 OUTLOOK_HEADLINES = {
-    "not_reserved": "Draft — nothing reserved yet",
+    "draft": "Draft — nothing allocated yet",
     "canceled": "Canceled",
-    "ready": "Ready — every component is staged",
-    "on_track": "On track — material is available or arriving before production start",
-    "at_risk": "At risk — an arrival date, transfer, or fixture needs follow-up",
-    "action_needed": "Action needed — material is short or a shortage decision is open",
+    "kit_ready": "Kit ready — every part accepted and staged",
+    "on_track": "On track — allocated, and known arrivals meet production start",
+    "unknown": "Unknown — an arrival or transfer date is not confirmed",
+    "at_risk": "At risk — late, short, or an open allocation decision",
 }
 
 
 def work_order_status(snap: Snapshot, r: Readiness, wo: WorkOrder) -> dict:
-    """Roll requirement statuses up into one outlook and the list of next actions."""
+    """Kit readiness, a separate schedule outlook, and the outstanding actions (PRD §5.4)."""
     items = sorted((r.items[i.id] for i in snap.items_by_wo.get(wo.id, [])),
-                   key=lambda i: ITEM_STATES.index(i.state) if i.state in ITEM_STATES else 99)
+                   key=lambda i: SITUATION_ORDER.index(i.state) if i.state in SITUATION_ORDER else 99)
     fixtures = snap.fixtures_by_wo.get(wo.id, [])
     actions: list[dict] = []
     if wo.state != "finalized":
-        outlook = "not_reserved" if wo.state == "draft" else "canceled"
+        outlook = wo.state
         if wo.state == "draft":
-            actions.append({"kind": "finalize", "label": "Finalize to reserve stock"})
+            actions.append({"kind": "finalize", "work_order_id": wo.id})
     else:
-        states = {i.state for i in items}
         blocking = {e.id: e for i in items for e in snap.exceptions_by_item.get(i.item_id, [])
                     if e.blocking and e.state != "closed"}
         pending_fixtures = [f for f in fixtures if f.coverage_state != "covered"]
+        kinds = {s["kind"] for i in items for s in i.situations}
         for i in items:
             if i.action:
-                actions.append({**i.action, "state": i.state, "item_id": i.item_id, "part_id": i.part_id,
-                                "part_number": i.part_number})
+                actions.append({**i.action, "situation": i.state, "qty": i.situation["qty"], "item_id": i.item_id,
+                                "part_id": i.part_id, "part_number": i.part_number})
         for f in pending_fixtures:
-            actions.append({"kind": "review_fixture", "fixture_id": f.id, "label": f.fixture_type, "qty": f.quantity})
+            actions.append({"kind": "confirm_fixture", "fixture_id": f.id, "label": f.fixture_type, "qty": f.quantity})
         for e in blocking.values():
-            actions.append({"kind": "resolve_exception", "exception_id": e.id, "label": e.title})
-        if states & {"short", "decision_needed"} or blocking:
-            outlook = "action_needed"
-        elif states & {"transfer_decision", "arrives_late", "arrival_unknown"} or pending_fixtures:
+            actions.append({"kind": "resolve_issue", "exception_id": e.id, "label": e.title})
+        kit_ready = (all(i.staged >= i.required for i in items) and not blocking and not pending_fixtures
+                     and "allocation_decision" not in kinds)
+        if kit_ready:
+            outlook = "kit_ready"
+        elif (kinds & {"allocation_decision", "short", "arrives_late"} or blocking or pending_fixtures
+              or any(i.timing == "late" for i in items) or snap.today >= wo.production_start_date):
             outlook = "at_risk"
-        elif states <= {"staged"}:
-            outlook = "ready"
+        elif kinds & {"arrival_unknown", "stock_at_other_site"} or any(i.timing == "unknown" for i in items):
+            outlook = "unknown"
         else:
             outlook = "on_track"
     return {
         "outlook": outlook,
         "headline": OUTLOOK_HEADLINES[outlook],
-        "ready": outlook == "ready",
+        "kit_ready": outlook == "kit_ready",
         "next_actions": actions,
-        "kit": {"lines": len(items), "staged": sum(i.state == "staged" for i in items),
-                "short_lines": sum(i.state in ("short", "decision_needed") for i in items)},
+        "kit": {"lines": len(items), "staged": sum(i.staged >= i.required for i in items)},
     }
 
 
-def material_shortages(snap: Snapshot, r: Readiness) -> list[dict]:
-    """Supply sources allocated beyond what they can deliver: one issue each, listing every affected order."""
+def allocation_decisions(snap: Snapshot, r: Readiness) -> list[dict]:
+    """Supply that competing work orders depend on and someone must split: a shortage (allocations exceed
+    supply) or received material that could go to several orders. One item per source line."""
     out = []
     for lid, q in r.line_quantities.items():
         claims = [a for a in r.allocs if a.source_type == "po_line" and a.source_id == lid]
-        if not any(a.review for a in claims):
+        if any(a.review for a in claims):
+            kind = "shortage"
+        elif q.pooled_accepted and len(claims) > 1:
+            kind = "received"
+        else:
             continue
         line = snap.lines[lid]
         po = snap.pos[line.po_id]
@@ -406,15 +508,15 @@ def material_shortages(snap: Snapshot, r: Readiness) -> list[dict]:
                              "work_order_number": wo.number, "production_start_date": wo.production_start_date,
                              "required_qty": item.required_qty, "allocated_qty": a.qty})
         affected.sort(key=lambda x: x["production_start_date"])
+        item_ids = {x["work_order_item_id"] for x in affected}
+        issues = [{"id": e.id, "type": e.type, "title": e.title} for e in snap.exceptions.values()
+                  if e.state != "closed" and any(l.work_order_item_id in item_ids for l in snap.exception_links.get(e.id, []))]
         out.append({
-            "po_line_id": lid, "po_id": po.id, "label": snap.line_label(lid), "part_id": part.id,
+            "kind": kind, "po_line_id": lid, "po_id": po.id, "label": snap.line_label(lid), "part_id": part.id,
             "part_number": part.part_number, "description": part.description,
-            "supplier": snap.suppliers[po.supplier_id].name,
+            "supplier": snap.suppliers[po.supplier_id].name, "warehouse": snap.warehouses[po.destination_warehouse_id].name,
             "allocated": q.claims, "available": q.pooled_accepted, "in_qa": q.pooled_pending,
             "not_received": q.outstanding, "scrapped": scrapped, "short": q.deficit, "affected": affected,
-            "exceptions": [e.id for e in snap.exceptions.values() if e.state != "closed"
-                           and any(l.work_order_item_id in {x["work_order_item_id"] for x in affected}
-                                   for l in snap.exception_links.get(e.id, []))],
-            "earliest_start": affected[0]["production_start_date"] if affected else None,
+            "issues": issues, "earliest_start": affected[0]["production_start_date"] if affected else None,
         })
     return out

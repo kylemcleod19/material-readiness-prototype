@@ -61,7 +61,7 @@ def po_line_quantities(db: Session, line: PurchaseOrderLine) -> LineQuantities:
     ).all()
     for sl, sh in rows:
         open_qty = sl.qty - received_against_shipment_line(db, sl.id)
-        open_shipments.append((open_qty, sh.expected_arrival, sh.number))
+        open_shipments.append((open_qty, sh.expected_arrival, sh.number, sh.id, sh.status == "arrived"))
     pooled = [
         (r.qty, r.quality_state)
         for r in db.scalars(select(InventoryRecord).where(InventoryRecord.pool_po_line_id == line.id))

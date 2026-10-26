@@ -1,6 +1,6 @@
 import {
-  AlertOctagon, ArrowRightLeft, Boxes, CalendarClock, CalendarDays, ClipboardCheck, ClipboardList, Clock,
-  GitCompareArrows, Hand, Layers, Menu, PackageOpen, PackagePlus, Repeat, ShoppingCart, Truck, Warehouse, X,
+  AlertOctagon, Boxes, CalendarClock, CalendarDays, ClipboardCheck, ClipboardList,
+  GitCompareArrows, Menu, PackageOpen, PackagePlus, ShoppingCart, Truck, Warehouse, X,
   type LucideIcon,
 } from "lucide-react";
 import { useState } from "react";
@@ -8,6 +8,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { useMaster, usePurchasingQueue, useQAQueue, useWarehouseQueue } from "@/api/hooks";
 import type { Role } from "@/api/types";
+import { ActionHost } from "@/components/ActionHost";
 import { DemoPanel } from "@/components/DemoPanel";
 import { ROLE_HOME, ROLE_LABELS, useRole } from "@/lib/role";
 import { cn, fmtDate } from "@/lib/utils";
@@ -21,27 +22,23 @@ const NAV: Record<Role, NavGroup[]> = {
   planning: [
     { items: [
       { to: "/work-orders", label: "Work orders", icon: ClipboardList },
-      { to: "/shortages", label: "Material shortages", icon: GitCompareArrows, count: "shortages", tone: "amber" },
-      { to: "/exceptions", label: "Exceptions", icon: AlertOctagon, count: "exceptions", tone: "amber" },
+      { to: "/allocate", label: "Allocate material", icon: GitCompareArrows, count: "allocate_material", tone: "amber" },
+    ] },
+    { label: "Reference", items: [
+      { to: "/exceptions", label: "Issues", icon: AlertOctagon, count: "issues", tone: "neutral" },
     ] },
   ],
   purchasing: [
-    { label: "Act on", items: [
-      { to: "/purchasing/queue", label: "Purchasing queue", icon: PackagePlus, count: "uncovered", tone: "red" },
-      { to: "/purchasing/shortages", label: "Material shortages", icon: GitCompareArrows, count: "shortages", tone: "amber" },
-      { to: "/purchasing/timing", label: "Arrival conflicts", icon: Clock, count: "timing", tone: "red" },
-      { to: "/purchasing/inventory-planning", label: "Inventory planning", icon: ArrowRightLeft, count: "remote_holds" },
-      { to: "/purchasing/checkins", label: "Check-ins", icon: CalendarClock, count: "checkins_due", tone: "amber" },
-      { to: "/purchasing/handoffs", label: "Receipt handoffs", icon: Hand, count: "handoffs" },
+    { label: "Work queues", items: [
+      { to: "/purchasing/source", label: "Source material", icon: PackagePlus, count: "source_material", tone: "red" },
+      { to: "/purchasing/follow-up", label: "Supplier follow-up", icon: CalendarClock, count: "supplier_follow_up", tone: "amber" },
+      { to: "/allocate", label: "Allocate material", icon: GitCompareArrows, count: "allocate_material", tone: "amber" },
     ] },
-    { label: "Plan", items: [
-      { to: "/purchasing/replenishment", label: "Replenishment", icon: Repeat, count: "replenishment" },
-      { to: "/purchasing/parts", label: "By part", icon: Layers },
-    ] },
-    { label: "Records", items: [
-      { to: "/purchasing/pos", label: "Purchase orders", icon: ShoppingCart, count: "pos_review", tone: "amber" },
+    { label: "Reference", items: [
+      { to: "/purchasing/pos", label: "Purchase orders", icon: ShoppingCart },
       { to: "/work-orders", label: "Work orders", icon: ClipboardList },
-      { to: "/exceptions", label: "Exceptions", icon: AlertOctagon, count: "exceptions", tone: "amber" },
+      { to: "/warehouse/inventory", label: "Inventory", icon: Warehouse },
+      { to: "/exceptions", label: "Issues", icon: AlertOctagon, count: "issues", tone: "neutral" },
     ] },
   ],
   warehouse: [
@@ -67,7 +64,7 @@ function useNavCounts(role: Role): Counts {
   const pq = usePurchasingQueue({ enabled: office });
   const wq = useWarehouseQueue(wh, { enabled: role === "warehouse" });
   const qa = useQAQueue({ enabled: role === "qa" });
-  const c: Counts = { ...(pq.data?.counts ?? {}) };
+  const c: Counts = { ...(pq.data?.counts ?? {}) } as Counts;
   if (wq.data) {
     c.arrivals = wq.data.arrivals.length + wq.data.transfers.length;
     c.putaway = wq.data.putaway.length;
@@ -159,7 +156,7 @@ export function Layout() {
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-4 py-5">
-        <Outlet />
+        <ActionHost><Outlet /></ActionHost>
       </main>
     </div>
   );

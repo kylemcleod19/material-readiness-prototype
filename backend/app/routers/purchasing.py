@@ -5,6 +5,7 @@ from app import schemas
 from app.db import get_db
 from app.routers.deps import get_actor
 from app.services import exceptions as exc_svc
+from app.services import sourcing
 from app.services import purchasing as svc
 from app.services import views
 from app.services.common import Actor, DomainError
@@ -112,3 +113,28 @@ def ack_exception(exc_id: str, body: schemas.NoteIn, db: Session = Depends(get_d
 def close_exception(exc_id: str, body: schemas.NoteIn, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
     return run_action(db, body.op_id, "exception.close",
                       lambda: exc_svc.close(db, actor, exc_id, body.note or "", body.op_id))
+
+
+@router.get("/sourcing/options")
+def sourcing_options(part_id: str, warehouse_id: str, db: Session = Depends(get_db)):
+    return views.sourcing_options(db, part_id, warehouse_id)
+
+
+@router.post("/sourcing/apply")
+def apply_sourcing(body: schemas.SourcingApply, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    return run_action(db, body.op_id, "sourcing.apply", lambda: sourcing.apply_sourcing(
+        db, actor, part_id=body.part_id, warehouse_id=body.warehouse_id,
+        release_holds=[h.model_dump() for h in body.release_holds],
+        transfers=[t.model_dump() for t in body.transfers],
+        assignments=[a.model_dump() for a in body.assignments],
+        purchase=body.purchase.model_dump() if body.purchase else None, op_id=body.op_id))
+
+
+@router.post("/purchase-orders/{po_id}/supplier-update")
+def supplier_update(po_id: str, body: schemas.SupplierUpdate, db: Session = Depends(get_db),
+                    actor: Actor = Depends(get_actor)):
+    return run_action(db, body.op_id, "po.supplier_update", lambda: svc.record_supplier_update(
+        db, actor, po_id, note=body.note, arrivals=[a.model_dump() for a in body.arrivals],
+        complete_checkin_ids=body.complete_checkin_ids,
+        next_checkin=body.next_checkin.model_dump() if body.next_checkin else None,
+        mark_reviewed=body.mark_reviewed, op_id=body.op_id))

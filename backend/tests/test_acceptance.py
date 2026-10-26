@@ -74,15 +74,16 @@ def test_shared_qa_rejection_requires_review_without_choosing_a_loser(client, db
     for number, claim in (("WO-1001", 40), ("WO-1002", 30), ("WO-1003", 30)):
         w = wo(client, number)
         it = item(client, w["id"], "ACT-100")
-        assert w["outlook"] == "action_needed" and it["state"] == "decision_needed"
+        assert w["outlook"] == "at_risk" and it["state"] == "allocation_decision"
         # Not claimed short, not claimed covered: the whole allocation needs a decision.
         assert it["review"] == claim and it["uncovered"] == 0 and it["available"] == 0
 
     queue = client.get("/api/views/purchasing-queue").json()
-    [shortage] = queue["material_shortages"]
+    [shortage] = queue["allocate_material"]
+    assert shortage["kind"] == "shortage" and [i["type"] for i in shortage["issues"]] == ["qa_rejection"]
     assert shortage["allocated"] == 100 and shortage["available"] == 80
     assert shortage["scrapped"] == 20 and shortage["short"] == 20
-    [exc] = [e for e in queue["exceptions"] if e["type"] == "qa_rejection"]
+    [exc] = [e for e in client.get("/api/exceptions").json() if e["type"] == "qa_rejection"]
     assert {l["work_order_number"] for l in exc["links"]} == {"WO-1001", "WO-1002", "WO-1003"}
 
     # Ambiguous claims are not pickable.
@@ -98,7 +99,7 @@ def test_rejection_with_spare_supply_still_raises_purchasing_exception(client, d
     assert res["deficit"] == 0 and res["exception_id"]
     exc = db.get(MaterialException, res["exception_id"])
     assert exc.type == "qa_rejection" and exc.affected_qty == 15
-    assert item(client, "wo_1003", "ACT-100")["state"] != "decision_needed"
+    assert item(client, "wo_1003", "ACT-100")["state"] != "allocation_decision"
 
 
 # 2 ---------------------------------------------------------------------------------------
@@ -118,7 +119,7 @@ def test_partial_receipt_conserves_quantity_and_ignores_duplicate_submits(client
 
     line = po_line(client, ACT_LINE)
     assert line["outstanding"] == 60 and line["received"] == 40
-    assert line["awaiting_handoff"] == 40 and line["claims"] == 100 and line["deficit"] == 0
+    assert line["received_unassigned"] == 40 and line["allocated"] == 100 and line["deficit"] == 0
     # Enough remaining incoming supply: commitments preserved, nobody flagged for review.
     for number in ("WO-1001", "WO-1002", "WO-1003"):
         assert item(client, wo(client, number)["id"], "ACT-100")["review"] == 0
@@ -130,7 +131,7 @@ def test_partial_receipt_conserves_quantity_and_ignores_duplicate_submits(client
     it = item(client, "wo_1001", "ACT-100")
     assert it["available"] == 40 and it["incoming"] == 0
     line = po_line(client, ACT_LINE)
-    assert line["claims"] == 60 and line["outstanding"] == 60 and line["awaiting_handoff"] == 0
+    assert line["allocated"] == 60 and line["outstanding"] == 60 and line["received_unassigned"] == 0
 
     # Staging changes stage only.
     available = next(s for s in it["sources"] if s["category"] == "available")
@@ -149,7 +150,7 @@ def test_incoming_assignment_respects_unallocated_balance(client):
                     json={"op_id": op(), "source_type": "po_line", "source_id": HAR_LINE, "qty": 20})
     assert r.json()["remaining_unallocated"] == 10
     w = wo(client, "WO-1008")
-    assert w["outlook"] == "on_track" and not w["ready"]  # on order, not ready
+    assert w["outlook"] == "on_track" and not w["kit_ready"]  # on order, not ready
     assert item(client, "wo_1008", "HAR-200")["state"] == "on_order"
     assert po_line(client, HAR_LINE)["unallocated"] == 10
 
@@ -184,7 +185,7 @@ def test_concurrent_assignments_cannot_exceed_source(client):
     for t in threads:
         t.join()
     assert sorted(v == "ok" for v in results.values()) == [False, True]
-    assert po_line(client, HAR_LINE)["claims"] == 90
+    assert po_line(client, HAR_LINE)["allocated"] == 90
 
     over = client.post("/api/work-order-items/woi_1006_1/allocations",
                        json={"op_id": op(), "source_type": "po_line", "source_id": HAR_LINE, "qty": 5})
@@ -241,7 +242,7 @@ def test_scenario_apply_commits_together_and_is_idempotent(client, db):
     assert act100_inventory(db) == {"pending": 0, "accepted": 80, "scrapped": 20}
     assert item(client, "wo_1003", "ACT-100")["uncovered"] == 20  # actual remaining shortage
     assert item(client, "wo_1001", "ACT-100")["available"] == 40
-    assert client.get("/api/views/purchasing-queue").json()["material_shortages"] == []
+    assert client.get("/api/views/purchasing-queue").json()["allocate_material"] == []
 
 
 def test_stale_scenario_apply_changes_nothing(client, db):
@@ -299,7 +300,8 @@ def test_staging_does_not_increase_inventory(client, db):
 
 def test_overdue_checkin_is_not_lateness_but_revised_arrival_is(client):
     queue = client.get("/api/views/purchasing-queue").json()
-    [ck] = [c for c in queue["checkins"] if c["po_number"] == "PO-5003"]
+    [fu] = [f for f in queue["supplier_follow_up"] if f["po_number"] == "PO-5003"]
+    [ck] = [{"id": x["task_id"], "status": x["status"]} for x in fu["reasons"] if x["type"] == "check_in"]
     assert ck["status"] == "overdue"
     fin = item(client, "wo_1004", "FIN-600")
     assert fin["timing"] == "on_time" and fin["late_qty"] == 0
@@ -313,7 +315,9 @@ def test_overdue_checkin_is_not_lateness_but_revised_arrival_is(client):
     w = wo(client, "WO-1004")
     assert w["production_start_date"] == "2026-12-03"
     assert w["outlook"] == "at_risk"
-    assert item(client, "wo_1004", "FIN-600")["action"]["kind"] == "update_arrival"
+    fin = item(client, "wo_1004", "FIN-600")
+    assert fin["action"] == {"kind": "record_supplier_update", "po_id": "po_5003", "target_type": "shipment",
+                             "target_id": "sh_7002", "po_number": "PO-5003", "target_label": "SH-7002"}
 
 
 def test_unknown_arrival_is_unknown_not_late(client):
@@ -337,7 +341,7 @@ def test_cancellation_releases_unused_and_keeps_physical_state(client, db):
     db.refresh(po)
     assert po.needs_review and po.status == "open"
     line = po_line(client, ACT_LINE)
-    assert line["claims"] == 60 and line["unallocated"] == 40
+    assert line["allocated"] == 60 and line["unallocated"] == 40
 
     staged = db.scalars(select(InventoryRecord).where(InventoryRecord.part_id == "prt_fst300",
                                                       InventoryRecord.stage == "staged")).all()
@@ -351,7 +355,7 @@ def test_cancellation_releases_unused_and_keeps_physical_state(client, db):
 
 def test_finalize_reserves_local_stock_and_drafts_reserve_nothing(client):
     draft = item(client, "wo_1005", "BRG-500")
-    assert draft["available"] == 0 and draft["local_free_stock"] == 6
+    assert draft["available"] == 0 and draft["available_to_allocate"] == 6
     client.post("/api/work-orders/wo_1005/finalize", json={})
     brg = item(client, "wo_1005", "BRG-500")
     har = item(client, "wo_1005", "HAR-200")
@@ -382,16 +386,150 @@ def test_demo_actions_run_through_services(client):
     assert date(2026, 11, 24).isoformat() == client.get("/api/health").json()["today"]
 
 
-def test_requirement_status_next_action_and_part_verdict(client):
-    w = next(x for x in client.get("/api/work-orders").json() if x["number"] == "WO-1008")
-    assert w["outlook"] == "action_needed"
-    [buy] = w["next_actions"]
-    assert buy["kind"] == "buy" and buy["qty"] == 20 and buy["part_number"] == "HAR-200"
-    assert buy["supplier"]["name"] == "Northgate Interconnect" and buy["unassigned_here"] == 30
 
-    har = next(p for p in client.get("/api/views/parts").json() if p["part_number"] == "HAR-200")
-    assert har["needed"] == 105 and har["gap"] == 35 and har["verdict"] == "short"
-    assert {p["destination"]["code"]: p["unassigned_here"] for p in har["purchases"]} == {"WEST": 30, "EAST": 0}
+
+def queues(client):
+    return client.get("/api/views/purchasing-queue").json()
+
+
+# PRD 4.17 / 4.2: Source material -------------------------------------------------------------
+
+
+def test_source_material_groups_by_part_and_site_with_work_order_detail(client):
+    client.post("/api/work-orders/wo_1005/finalize", json={})
+    src = queues(client)["source_material"]
+    west = next(g for g in src["groups"] if g["part_number"] == "HAR-200" and g["warehouse"]["code"] == "WEST")
+    assert west["short"] == 45 and west["reasons"] == ["short"]
+    assert [r["work_order_number"] for r in west["requirements"]] == ["WO-1008", "WO-1005"]
+    assert west["supplier"]["name"] == "Northgate Interconnect" and west["unallocated_on_order"] == 30
+    thp = next(g for g in src["groups"] if g["part_number"] == "THP-400")
+    assert thp["reasons"] == ["stock_at_other_site"] and thp["at_other_site"] == 10
+    brg = next(g for g in src["groups"] if g["part_number"] == "BRG-500")
+    assert brg["reasons"] == ["replenishment"] and brg["replenishment"] > 0  # a reason, not a separate page
+    # By work order is the same demand, one row per requirement, with created dates.
+    assert all(r["created_at"] for r in src["requirements"])
+    assert {r["work_order_number"] for r in src["requirements"]} >= {"WO-1005", "WO-1006", "WO-1008", "WO-1004"}
+
+
+def test_sourcing_apply_assigns_and_buys_together(client):
+    r = client.post("/api/sourcing/apply", json={
+        "op_id": op(), "part_id": "prt_har200", "warehouse_id": "wh_west",
+        "assignments": [{"work_order_item_id": "woi_1008_1", "source_type": "po_line", "source_id": HAR_LINE, "qty": 10}],
+        "purchase": {"supplier_id": "sup_northgate", "expected_arrival": "2026-12-15", "general_stock": 5,
+                     "allocations": [{"work_order_item_id": "woi_1008_1", "qty": 10}]}})
+    assert r.status_code == 200, r.text
+    assert r.json()["remaining"] == [{"work_order_number": "WO-1008", "short": 0, "at_other_site": 0, "situation": "on_order"}]
+    assert po_line(client, HAR_LINE)["unallocated"] == 20
+
+
+def test_sourcing_apply_is_all_or_nothing(client, db):
+    before = _live_allocations(db)
+    r = client.post("/api/sourcing/apply", json={
+        "op_id": op(), "part_id": "prt_har200", "warehouse_id": "wh_west",
+        "assignments": [{"work_order_item_id": "woi_1008_1", "source_type": "po_line", "source_id": HAR_LINE, "qty": 10}],
+        "purchase": {"supplier_id": "sup_northgate", "allocations": [{"work_order_item_id": "woi_1008_1", "qty": 50}]}})
+    assert r.status_code == 422
+    assert _live_allocations(db) == before
+
+
+def test_buy_instead_replaces_remote_stock_in_one_step(client):
+    thp = item(client, "wo_1004", "THP-400")
+    assert thp["state"] == "stock_at_other_site" and thp["action"]["kind"] == "source_material"
+    hold = next(s for s in thp["sources"] if s["category"] == "remote_hold")
+    r = client.post("/api/sourcing/apply", json={
+        "op_id": op(), "part_id": "prt_thp400", "warehouse_id": "wh_west",
+        "release_holds": [{"allocation_id": hold["allocation_id"], "qty": 10}],
+        "purchase": {"supplier_id": "sup_coolfab", "expected_arrival": "2026-12-01",
+                     "allocations": [{"work_order_item_id": "woi_1004_2", "qty": 10}]}})
+    assert r.status_code == 200, r.text
+    thp = item(client, "wo_1004", "THP-400")
+    assert thp["remote_hold"] == 0 and thp["incoming"] == 10 and thp["uncovered"] == 0
+
+
+def test_cannot_take_more_from_another_site_than_needed(client):
+    r = client.post("/api/sourcing/apply", json={
+        "op_id": op(), "part_id": "prt_fst300", "warehouse_id": "wh_west",
+        "transfers": [{"work_order_item_id": "woi_1001_2", "inventory_record_id": "inv_ctrl_fst300", "qty": 1}]})
+    assert r.status_code == 422  # WO-1001's FST-300 is already fully allocated
+
+
+# PRD 4.18: Supplier follow-up ---------------------------------------------------------------
+
+
+def test_supplier_update_records_dates_completes_checkin_and_schedules_next(client):
+    [po5003] = [f for f in queues(client)["supplier_follow_up"] if f["po_number"] == "PO-5003"]
+    assert [x["type"] for x in po5003["reasons"]] == ["check_in"]  # an overdue check-in alone is not lateness
+    r = client.post("/api/purchase-orders/po_5003/supplier-update", json={
+        "note": "Ridgeline: SH-7002 slips to Dec 5",
+        "arrivals": [{"target_type": "shipment", "target_id": "sh_7002", "expected_arrival": "2026-12-05"}],
+        "complete_checkin_ids": po5003["open_checkin_ids"], "next_checkin": {"due_date": "2026-12-01"}})
+    assert r.status_code == 200, r.text
+    [po5003] = [f for f in queues(client)["supplier_follow_up"] if f["po_number"] == "PO-5003"]
+    # Completing the check-in does not remove the unresolved delivery conflict.
+    assert [x["type"] for x in po5003["reasons"]] == ["late_arrival"] and po5003["next_checkin"] == "2026-12-01"
+    assert item(client, "wo_1004", "FIN-600")["state"] == "arrives_late"
+
+
+def test_supplier_update_rejects_targets_from_another_po(client):
+    r = client.post("/api/purchase-orders/po_5003/supplier-update", json={
+        "note": "x", "arrivals": [{"target_type": "shipment", "target_id": "sh_7001", "expected_arrival": "2026-12-05"}]})
+    assert r.status_code == 422
+
+
+# PRD 5.4: situations and schedule outlook ---------------------------------------------------
+
+
+def test_received_material_shows_awaiting_qa_not_arriving(client):
+    receive(client, 100)
+    act = item(client, "wo_1001", "ACT-100")
+    assert act["state"] == "awaiting_qa" and act["action"]["kind"] == "inspect"
+    assert all(s["kind"] not in ("arrives_late", "arrival_unknown", "on_order") for s in act["situations"])
+
+
+def test_outlook_rules(client):
+    outlooks = {w["number"]: w["outlook"] for w in client.get("/api/work-orders").json()}
+    assert outlooks["WO-1008"] == "at_risk"   # confirmed short
+    assert outlooks["WO-1004"] == "unknown"   # stock at another site; transfer timing not confirmed
+    assert outlooks["WO-1003"] == "on_track"  # allocated; known arrivals meet production start
+    assert outlooks["WO-1005"] == "draft"
+    client.post("/api/arrivals", json={"target_type": "shipment", "target_id": "sh_7001",
+                                       "expected_arrival": None, "basis": "carrier_estimate"})
+    assert {w["number"]: w["outlook"] for w in client.get("/api/work-orders").json()}["WO-1003"] == "unknown"
+
+
+# PRD 4.10: Allocate material ----------------------------------------------------------------
+
+
+def test_partial_receipt_becomes_allocation_decision_resolved_in_workspace(client):
+    rec = receive(client, 40)
+    complete_qa(client, rec["lines"][0]["qa_batch_id"], 40, 0)
+    [decision] = queues(client)["allocate_material"]
+    assert decision["kind"] == "received" and decision["available"] == 40 and decision["short"] == 0
+    sid = client.post("/api/scenarios", json={"po_line_id": ACT_LINE}).json()["scenario_id"]
+    assert client.post("/api/scenarios", json={"po_line_id": ACT_LINE}).json()["scenario_id"] == sid  # same draft reused
+    rows = {x["work_order_number"]: x for x in client.get(f"/api/scenarios/{sid}").json()["rows"]}
+    props = [{"work_order_item_id": rows["WO-1001"]["work_order_item_id"], "available_qty": 40, "incoming_qty": 0},
+             {"work_order_item_id": rows["WO-1002"]["work_order_item_id"], "available_qty": 0, "incoming_qty": 30},
+             {"work_order_item_id": rows["WO-1003"]["work_order_item_id"], "available_qty": 0, "incoming_qty": 30}]
+    assert client.put(f"/api/scenarios/{sid}", json={"proposals": props}).json()["feasible"]
+    assert client.post(f"/api/scenarios/{sid}/apply", json={"op_id": op()}).status_code == 200
+    assert item(client, "wo_1001", "ACT-100")["available"] == 40
+    assert queues(client)["allocate_material"] == []
+
+
+def test_apply_can_close_the_linked_qa_issue(client, db):
+    _rejected_shared_receipt(client)
+    [decision] = queues(client)["allocate_material"]
+    issue_id = decision["issues"][0]["id"]
+    sid = client.post("/api/scenarios", json={"po_line_id": ACT_LINE}).json()["scenario_id"]
+    rows = {x["work_order_number"]: x for x in client.get(f"/api/scenarios/{sid}").json()["rows"]}
+    props = [{"work_order_item_id": rows[n]["work_order_item_id"], "available_qty": q, "incoming_qty": 0}
+             for n, q in (("WO-1001", 40), ("WO-1002", 30), ("WO-1003", 10))]
+    client.put(f"/api/scenarios/{sid}", json={"proposals": props})
+    assert client.post(f"/api/scenarios/{sid}/apply", json={"op_id": op(), "close_issue_ids": [issue_id]}).status_code == 200
+    db.expire_all()
+    assert db.get(MaterialException, issue_id).state == "closed"
+    assert item(client, "wo_1003", "ACT-100")["state"] == "short"  # the shortage itself stays visible
 
 
 def test_scrapped_units_leave_inventory(client):

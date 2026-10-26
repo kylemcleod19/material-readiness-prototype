@@ -14,7 +14,7 @@ export const ROLE_LABELS: Record<Role, string> = {
 
 export const ROLE_HOME: Record<Role, string> = {
   planning: "/work-orders",
-  purchasing: "/purchasing/queue",
+  purchasing: "/purchasing/source",
   warehouse: "/warehouse",
   qa: "/qa",
 };

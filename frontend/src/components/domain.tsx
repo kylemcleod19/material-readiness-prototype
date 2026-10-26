@@ -2,75 +2,64 @@ import { AlertTriangle, CircleHelp, Clock, Info, Loader2, PackageCheck, Truck } 
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 
-import type { Outlook, ReqState, Timing } from "@/api/types";
+import type { Outlook, Situation, SituationKind, Timing } from "@/api/types";
 import { Badge, Callout, type Tone } from "@/components/ui/primitives";
 import { cn, fmtDate, fmtDateTime, relDays } from "@/lib/utils";
 
-// ------------------------------------------------------------------ outlook & requirement status (PRD §5.4)
+// ------------------------------------------------------------------ schedule outlook & situations (PRD 5.4)
 
 const OUTLOOK: Record<Outlook, { tone: Tone; label: string }> = {
-  ready: { tone: "green", label: "Ready" },
+  kit_ready: { tone: "green", label: "Kit ready" },
   on_track: { tone: "blue", label: "On track" },
-  at_risk: { tone: "amber", label: "At risk" },
-  action_needed: { tone: "red", label: "Action needed" },
-  not_reserved: { tone: "neutral", label: "Draft" },
+  unknown: { tone: "neutral", label: "Unknown" },
+  at_risk: { tone: "red", label: "At risk" },
+  draft: { tone: "neutral", label: "Draft" },
   canceled: { tone: "neutral", label: "Canceled" },
 };
 
-/** Can this work order meet its production start? */
+/** Can this work order meet its production start? Separate from who has a task. */
 export function OutlookBadge({ outlook }: { outlook: Outlook }) {
   const o = OUTLOOK[outlook];
   return <Badge tone={o.tone}>{o.label}</Badge>;
 }
 
-export interface StatusInput { state: ReqState; short?: number; expected?: string | null; late_qty?: number }
-
-const REQ_STATE: Record<ReqState, { tone: Tone; label: (s: StatusInput) => string }> = {
-  short: { tone: "red", label: (s) => `Short ${s.short ?? ""}`.trim() },
-  decision_needed: { tone: "amber", label: () => "Shortage — decision needed" },
-  transfer_decision: { tone: "violet", label: () => "Stock at another site" },
-  arrives_late: { tone: "red", label: (s) => (s.expected ? `Arrives ${fmtDate(s.expected)} — after start` : "Arrives after start") },
-  arrival_unknown: { tone: "neutral", label: () => "Arrival date unknown" },
-  on_order: { tone: "blue", label: (s) => (s.expected ? `Arriving ${fmtDate(s.expected)}` : "On order") },
-  ready_to_stage: { tone: "green", label: () => "Available — not staged" },
-  staged: { tone: "dark", label: () => "Staged" },
-  not_reserved: { tone: "neutral", label: () => "Not reserved (draft)" },
-  canceled: { tone: "neutral", label: () => "Canceled" },
+const SITUATION_TONE: Record<SituationKind, string> = {
+  allocation_decision: "text-amber-700", short: "text-red-700", stock_at_other_site: "text-violet-700",
+  arrives_late: "text-red-700", arrival_unknown: "text-zinc-600", awaiting_receipt: "text-blue-700",
+  awaiting_qa: "text-amber-700", on_order: "text-blue-700", transfer_in_transit: "text-blue-700",
+  ready_to_stage: "text-green-700", staged: "text-zinc-700", not_reserved: "text-zinc-500", canceled: "text-zinc-500",
 };
 
-/** The one status a requirement has; replaces a column per quantity bucket. */
-export function ReqStatus(s: StatusInput) {
-  const r = REQ_STATE[s.state];
-  return <Badge tone={r.tone}>{r.label(s)}</Badge>;
+/** Operator wording for one situation (PRD 1a, 5.4). */
+export function situationText(s: Pick<Situation, "kind" | "qty" | "date" | "detail">): string {
+  const on = s.date ? fmtDate(s.date) : null;
+  switch (s.kind) {
+    case "allocation_decision":
+      return s.detail === "received" ? `${s.qty} received — allocation decision needed` : "Allocation decision needed";
+    case "short": return `Short ${s.qty}`;
+    case "stock_at_other_site": return `Stock at another site${s.detail ? ` (${s.detail})` : ""}`;
+    case "arrives_late": return `${s.qty} arrive ${on ?? "after start"} — after production start`;
+    case "arrival_unknown": return "Arrival date unknown";
+    case "awaiting_receipt": return "Arrived — awaiting receipt";
+    case "awaiting_qa": return `${s.qty} awaiting QA`;
+    case "on_order": return `${s.qty} on order${on ? ` — arriving ${on}` : s.detail === "multiple arrivals" ? " — multiple arrivals" : ""}`;
+    case "transfer_in_transit": return `Transfer in transit${on ? ` — arriving ${on}` : ""}`;
+    case "ready_to_stage": return "Available — not staged";
+    case "staged": return "Staged";
+    case "not_reserved": return "Not allocated (draft)";
+    case "canceled": return "Canceled";
+  }
 }
 
-/** Short plain-language breakdown of how a requirement is covered, e.g. "10 available · 20 short". */
-export function CoverageText({ staged = 0, available = 0, onOrder = 0, otherSite = 0, decision = 0, short = 0 }: {
-  staged?: number; available?: number; onOrder?: number; otherSite?: number; decision?: number; short?: number;
-}) {
-  const parts: [number, string, string][] = [
-    [staged, "staged", "text-zinc-700"],
-    [available - staged, "available", "text-green-700"],
-    [onOrder, "on order", "text-blue-700"],
-    [otherSite, "at another site", "text-violet-700"],
-    [decision, "need a decision", "text-amber-700"],
-    [short, "short", "text-red-700"],
-  ];
-  const shown = parts.filter(([n]) => n > 0);
-  if (!shown.length) return <span className="text-zinc-400">nothing allocated</span>;
-  return (
-    <span className="text-xs tabular">
-      {shown.map(([n, label, color], i) => (
-        <span key={label}>{i > 0 && <span className="text-zinc-300"> · </span>}<span className={color}><b>{n}</b> {label}</span></span>
-      ))}
-    </span>
-  );
+/** A situation as plain colored text; badges are reserved for the outlook. */
+export function SituationText({ s, strong }: { s: Pick<Situation, "kind" | "qty" | "date" | "detail">; strong?: boolean }) {
+  return <span className={cn("text-sm", SITUATION_TONE[s.kind], strong && "font-medium")}>{situationText(s)}</span>;
 }
 
 /** Key facts as labeled fields instead of a run-on subheading. */
 export function FactList({ facts, className }: { facts: [string, ReactNode][]; className?: string }) {
   return (
-    <dl className={cn("grid grid-cols-2 gap-x-6 gap-y-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:grid-cols-3 lg:grid-cols-6", className)}>
+    <dl className={cn("grid grid-cols-2 gap-x-6 gap-y-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:grid-cols-3 lg:grid-cols-7", className)}>
       {facts.map(([k, v]) => (
         <div key={k} className="min-w-0">
           <dt className="text-xs text-zinc-500">{k}</dt>

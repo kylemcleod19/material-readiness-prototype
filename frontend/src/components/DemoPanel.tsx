@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTrigger } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/primitives";
 import { ROLE_LABELS } from "@/lib/role";
+import { SupplierFeedSimulator } from "./SupplierFeedSimulator";
 
 /** Named demo actions that call the normal services, plus a reset of the disposable demo DB. */
 export function DemoPanel() {
@@ -52,8 +53,9 @@ export function DemoPanel() {
           ))}
         </ol>
         <p className="mt-3 text-sm text-zinc-600">
-          After step 3, open <b>Purchasing → Material shortages</b> and decide how to split the remaining ACT-100.
+          After step 3, open <b>Allocate material</b> and decide how to split the remaining ACT-100.
         </p>
+        <div className="mt-4"><SupplierFeedSimulator /></div>
         <div className="mt-5 flex justify-end border-t pt-4">
           <Button variant="destructive" disabled={busy !== null} onClick={() => {
             if (confirm("Restore the seeded demo state? All demo changes will be lost.")) run("reset", "/demo/reset");

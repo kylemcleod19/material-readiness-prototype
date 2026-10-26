@@ -65,7 +65,7 @@ function QAForm({ b, onDone }: { b: QAPending; onDone: (r: { deficit: number; re
           <Input type="number" inputMode="numeric" className="h-14 text-2xl font-semibold tabular text-green-700" value={accepted}
             onChange={(e) => setRejected(Math.max(0, b.input_qty - Number(e.target.value)))} />
         </Field>
-        <Field label="Rejected (scrapped)">
+        <Field label="Reject and scrap">
           <Input type="number" inputMode="numeric" className="h-14 text-2xl font-semibold tabular text-red-700" value={rejected} min={0} max={b.input_qty}
             onChange={(e) => setRejected(Math.min(b.input_qty, Math.max(0, Number(e.target.value))))} />
         </Field>
@@ -75,7 +75,7 @@ function QAForm({ b, onDone }: { b: QAPending; onDone: (r: { deficit: number; re
         </Field>
       </Card>
       <Button size="xl" disabled={!valid || complete.isPending} onClick={() => complete.mutate({ accepted_qty: accepted, rejected_qty: rejected, note })}>
-        Record {accepted} accepted{rejected ? ` / ${rejected} rejected` : ""}
+        Record {accepted} accepted{rejected ? `, reject and scrap ${rejected}` : ""}
       </Button>
     </div>
   );

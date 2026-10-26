@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { newOpId } from "@/lib/utils";
 import { api } from "./client";
 import type {
-  DemoAction, InventoryView, Master, MaterialException, PartView, PurchaseOrder, PurchasingQueue,
+  DemoAction, InventoryView, Master, MaterialException, PurchaseOrder, PurchasingQueue, SourcingOptions,
   QAPending, ScenarioPreview, WarehouseQueue, WorkOrderDetail, WorkOrderSummary,
 } from "./types";
 
@@ -13,7 +13,7 @@ export const keys = {
   workOrders: ["readiness", "work-orders"] as const,
   workOrder: (id: string) => ["readiness", "work-order", id] as const,
   purchasing: ["readiness", "purchasing-queue"] as const,
-  parts: ["readiness", "parts"] as const,
+  sourcing: (part: string, wh: string) => ["readiness", "sourcing", part, wh] as const,
   pos: ["readiness", "pos"] as const,
   po: (id: string) => ["readiness", "po", id] as const,
   warehouse: (wh: string) => ["readiness", "warehouse", wh] as const,
@@ -30,7 +30,9 @@ export const useWorkOrder = (id: string) =>
   useQuery({ queryKey: keys.workOrder(id), queryFn: () => api<WorkOrderDetail>(`/work-orders/${id}`) });
 export const usePurchasingQueue = (opts: { enabled?: boolean } = {}) =>
   useQuery({ queryKey: keys.purchasing, queryFn: () => api<PurchasingQueue>("/views/purchasing-queue"), enabled: opts.enabled ?? true });
-export const useParts = () => useQuery({ queryKey: keys.parts, queryFn: () => api<PartView[]>("/views/parts") });
+export const useSourcingOptions = (partId: string, warehouseId: string, enabled: boolean) =>
+  useQuery({ queryKey: keys.sourcing(partId, warehouseId), enabled,
+    queryFn: () => api<SourcingOptions>(`/sourcing/options?part_id=${partId}&warehouse_id=${warehouseId}`) });
 export const usePurchaseOrders = () => useQuery({ queryKey: keys.pos, queryFn: () => api<PurchaseOrder[]>("/purchase-orders") });
 export const usePurchaseOrder = (id: string) =>
   useQuery({ queryKey: keys.po(id), queryFn: () => api<PurchaseOrder>(`/purchase-orders/${id}`) });

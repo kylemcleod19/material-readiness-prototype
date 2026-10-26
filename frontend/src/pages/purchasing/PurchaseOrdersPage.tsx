@@ -11,7 +11,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { fmtDate } from "@/lib/utils";
 
 const col = createColumnHelper<PurchaseOrder>();
-const total = (po: PurchaseOrder, k: "ordered" | "received" | "claims" | "unallocated" | "deficit" | "outstanding") =>
+const total = (po: PurchaseOrder, k: "ordered" | "received" | "allocated" | "unallocated" | "deficit" | "outstanding") =>
   po.lines.reduce((a, l) => a + l[k], 0);
 
 function nextEta(po: PurchaseOrder): string | null {
@@ -30,7 +30,7 @@ const columns = [
   col.accessor((r) => total(r, "ordered"), { id: "ordered", header: "Ordered", ...right, cell: (c) => <Num v={c.getValue()} /> }),
   col.accessor((r) => total(r, "received"), { id: "received", header: "Received", ...right, cell: (c) => <Num v={c.getValue()} /> }),
   col.accessor((r) => total(r, "outstanding"), { id: "outstanding", header: "Not received", ...right, cell: (c) => <Num v={c.getValue()} tone="blue" /> }),
-  col.accessor((r) => total(r, "claims"), { id: "claims", header: "Allocated", ...right, cell: (c) => <Num v={c.getValue()} /> }),
+  col.accessor((r) => total(r, "allocated"), { id: "allocated", header: "Allocated", ...right, cell: (c) => <Num v={c.getValue()} /> }),
   col.accessor((r) => total(r, "unallocated"), { id: "free", header: "Unallocated", ...right, cell: (c) => <Num v={c.getValue()} tone="green" /> }),
   col.accessor((r) => total(r, "deficit"), { id: "short", header: "Short", ...right, cell: (c) => <Num v={c.getValue()} tone="red" /> }),
   col.accessor((r) => nextEta(r) ?? "", { id: "eta", header: "Next arrival", cell: (c) => (c.getValue() ? fmtDate(c.getValue()) : "·") }),

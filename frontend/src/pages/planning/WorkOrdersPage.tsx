@@ -10,46 +10,36 @@ import { OutlookBadge, PageHeader, QueryView, StartDate } from "@/components/dom
 import { actionLabel, NextActionButton } from "@/components/NextAction";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { fmtDate } from "@/lib/utils";
 
 const col = createColumnHelper<WorkOrderSummary>();
-const OUTLOOK_ORDER = { action_needed: 0, at_risk: 1, on_track: 2, ready: 3, not_reserved: 4, canceled: 5 };
+const OUTLOOK_ORDER = { at_risk: 0, unknown: 1, on_track: 2, kit_ready: 3, draft: 4, canceled: 5 };
 
 const columns = [
   col.accessor("number", { header: "Work order", cell: (c) => <Link to={`/work-orders/${c.row.original.id}`} className="font-medium text-blue-700 hover:underline">{c.getValue()}</Link> }),
   col.accessor("title", { header: "Title", cell: (c) => <span className="text-zinc-600">{c.getValue()}</span> }),
   col.accessor("program", { header: "Program" }),
   col.accessor((r) => r.warehouse.name, { id: "site", header: "Site" }),
+  col.accessor("created_at", { header: "Created", cell: (c) => <span className="tabular whitespace-nowrap">{fmtDate(c.getValue())}</span> }),
   col.accessor("production_start_date", { id: "start", header: "Production start", cell: (c) => <StartDate date={c.getValue()} days={c.row.original.days_to_start} /> }),
   col.accessor((r) => OUTLOOK_ORDER[r.outlook], {
-    id: "outlook", header: "Outlook",
+    id: "outlook", header: "Schedule outlook",
     cell: (c) => <span title={c.row.original.headline}><OutlookBadge outlook={c.row.original.outlook} /></span>,
   }),
-  col.accessor((r) => r.kit.staged, {
-    id: "kit", header: "Parts staged",
-    cell: (c) => <span className="tabular whitespace-nowrap">{c.row.original.kit.staged} of {c.row.original.kit.lines}</span>,
-  }),
-  col.display({
+  col.accessor((r) => r.kit.staged, { id: "kit", header: "Parts staged", cell: (c) => <span className="tabular whitespace-nowrap">{c.row.original.kit.staged} of {c.row.original.kit.lines}</span> }),
+  col.accessor("action_count", {
     id: "next", header: "Next action",
     cell: (c) => {
-      const w = c.row.original;
-      const [first, ...rest] = w.next_actions;
-      if (!first) return <span className="text-zinc-400">{w.outlook === "on_track" ? "Waiting on arrivals" : "—"}</span>;
-      return (
-        <span className="text-sm">
-          {actionLabel(first)}
-          {rest.length > 0 && <span className="ml-1 text-xs text-zinc-500">+{rest.length} more</span>}
-        </span>
-      );
+      const [first, ...rest] = c.row.original.next_actions;
+      if (!first) return <span className="text-zinc-400">None</span>;
+      return <span className="text-sm">{actionLabel(first)}{rest.length > 0 && <span className="ml-1 text-xs text-zinc-500">+{rest.length} more</span>}</span>;
     },
   }),
   col.display({
     id: "act", header: "",
     cell: (c) => {
-      const w = c.row.original;
-      const first = w.next_actions[0];
-      if (!first) return null;
-      return <NextActionButton action={first}
-        ctx={{ woId: w.id, woNumber: w.number, warehouse: w.warehouse, start: w.production_start_date }} />;
+      const first = c.row.original.next_actions[0];
+      return first ? <div className="flex justify-end"><NextActionButton action={first} woId={c.row.original.id} /></div> : null;
     },
   }),
 ];
@@ -60,8 +50,8 @@ export function WorkOrdersPage() {
   const navigate = useNavigate();
   return (
     <div>
-      <PageHeader title="Work orders" subtitle="Can each build start on time, and what has to happen first?"
-        info="Ready: every part staged. On track: everything available or arriving before production start. At risk: a late or unknown arrival, a transfer decision, or an unconfirmed fixture. Action needed: material is short or a shortage decision is open."
+      <PageHeader title="Work orders" subtitle="Kit readiness and schedule outlook by production start."
+        info="Kit ready: every part accepted and staged, decisions resolved, fixture coverage recorded. At risk: late, short, an open allocation decision, an unconfirmed fixture, or an incomplete kit at production start. Unknown: an arrival or transfer date is not confirmed. On track: otherwise; receiving, QA, or staging may still be pending."
         actions={<Button asChild size="sm"><Link to="/work-orders/new"><Plus />New draft</Link></Button>} />
       <QueryView q={q}>
         {(rows) => (

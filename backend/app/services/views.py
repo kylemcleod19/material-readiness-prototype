@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import ChangeHistory, PartStockPolicy, PlanningScenario
 from app.services.common import NotFound
-from app.services.readiness import Readiness, Snapshot, compute, material_shortages, work_order_status
+from app.services.readiness import Readiness, Snapshot, allocation_decisions, compute, work_order_status
 
 
 def _load(db: Session) -> tuple[Snapshot, Readiness]:
@@ -33,42 +33,56 @@ def _supplier(snap: Snapshot, part_id: str) -> dict | None:
     return {"id": part.preferred_supplier_id, "name": snap.suppliers[part.preferred_supplier_id].name}
 
 
+def _free_stock(snap: Snapshot, r: Readiness, part_id: str, wh_id: str) -> list[tuple]:
+    """(record, quantity available to allocate) for accepted local stock not allocated, staged, or in transfer."""
+    out = []
+    for rec in snap.inventory.values():
+        if rec.part_id == part_id and rec.warehouse_id == wh_id and snap.is_free_stock(rec):
+            free = snap.free_qty(rec, r.allocs)
+            if free > 0:
+                out.append((rec, free))
+    return out
+
+
 def _assignable(snap: Snapshot, r: Readiness, part_id: str, wh_id: str) -> int:
-    """Stock or open PO quantity at a site that no work order has been allocated yet."""
-    free_stock = sum(snap.free_qty(rec, r.allocs) for rec in snap.inventory.values()
-                     if rec.part_id == part_id and rec.warehouse_id == wh_id and snap.is_free_stock(rec))
+    """Available to allocate plus unallocated on order at one site."""
     free_po = sum(r.line_quantities[lid].unallocated for lid, line in snap.lines.items()
                   if line.part_id == part_id and snap.pos[line.po_id].destination_warehouse_id == wh_id
                   and snap.pos[line.po_id].status == "open")
-    return free_stock + free_po
+    return sum(q for _, q in _free_stock(snap, r, part_id, wh_id)) + free_po
 
 
-def _enrich_action(snap: Snapshot, r: Readiness, wo, a: dict) -> dict:
-    """Add what a button needs to act right where the problem is shown."""
+def _enrich(snap: Snapshot, a: dict | None) -> dict | None:
+    """Add the labels an action button needs so it opens with its context preselected (PRD §4.18)."""
+    if not a:
+        return a
     a = dict(a)
-    if a["kind"] == "buy":
-        a["supplier"] = _supplier(snap, a["part_id"])
-        a["unassigned_here"] = _assignable(snap, r, a["part_id"], wo.warehouse_id)
-    elif a["kind"] == "resolve_shortage" and a.get("po_line_id"):
+    kind = a["kind"]
+    if kind == "source_material":
+        a["warehouse"] = _wh(snap, a["warehouse_id"])
+        a["part_number"] = snap.parts[a["part_id"]].part_number
+    elif kind == "allocate_material":
         a["po_line_label"] = snap.line_label(a["po_line_id"])
-    elif a["kind"] in ("update_arrival", "get_arrival_date") and a.get("po_id"):
+    elif kind == "record_supplier_update":
         a["po_number"] = snap.pos[a["po_id"]].number
-    elif a["kind"] == "decide_transfer" and a.get("from_warehouse"):
-        a["from_warehouse"] = _wh(snap, a["from_warehouse"])
+        a["target_label"] = (snap.shipments[a["target_id"]].number if a["target_type"] == "shipment"
+                             else snap.line_label(a["target_id"]))
+    elif kind == "receive" and a.get("shipment_id"):
+        a["shipment_number"] = snap.shipments[a["shipment_id"]].number
     return a
 
 
 def _wo_summary(snap: Snapshot, r: Readiness, wo) -> dict:
     st = work_order_status(snap, r, wo)
-    st["next_actions"] = [_enrich_action(snap, r, wo, a) if "part_id" in a else a for a in st["next_actions"]]
+    st["next_actions"] = [_enrich(snap, a) for a in st["next_actions"]]
     fixtures = snap.fixtures_by_wo.get(wo.id, [])
     item_ids = {i.id for i in snap.items_by_wo.get(wo.id, [])}
     open_exc = {e.id for iid in item_ids for e in snap.exceptions_by_item.get(iid, []) if e.state != "closed"}
     return {
         "id": wo.id, "number": wo.number, "title": wo.title, "program": snap.programs[wo.program_id].name,
         "warehouse": _wh(snap, wo.warehouse_id), "production_start_date": wo.production_start_date,
-        "days_to_start": (wo.production_start_date - snap.today).days, "state": wo.state, "build_qty": wo.build_qty,
-        **st,
+        "created_at": wo.created_at, "days_to_start": (wo.production_start_date - snap.today).days,
+        "state": wo.state, "build_qty": wo.build_qty, **st, "action_count": len(st["next_actions"]),
         "fixtures": {"total": len(fixtures), "covered": sum(f.coverage_state == "covered" for f in fixtures)},
         "open_exceptions": len(open_exc),
     }
@@ -82,64 +96,10 @@ def work_orders(db: Session) -> list[dict]:
     return rows
 
 
-def _supply_options(snap: Snapshot, r: Readiness, item, wo) -> list[dict]:
-    """Existing supply a planner could assign before buying more. Incoming supply is 'on order'."""
-    opts = []
-    for lid, line in snap.lines.items():
-        po = snap.pos[line.po_id]
-        if line.part_id != item.part_id or po.status != "open":
-            continue
-        q = r.line_quantities[lid]
-        if q.unallocated <= 0:
-            continue
-        etas = sorted({b.eta for b in q.buckets if not b.arrived}, key=lambda d: (d is None, d))
-        opts.append({
-            "source_type": "po_line", "source_id": lid, "label": snap.line_label(lid),
-            "supplier": snap.suppliers[po.supplier_id].name, "destination": _wh(snap, po.destination_warehouse_id),
-            "compatible": po.destination_warehouse_id == wo.warehouse_id, "unallocated": q.unallocated,
-            "expected_arrivals": etas, "kind": "on_order",
-            "arrives_after_start": any(e is not None and e > wo.production_start_date for e in etas),
-        })
-    for t in snap.transfers.values():
-        if t.part_id != item.part_id or t.status not in ("planned", "in_transit"):
-            continue
-        used = sum(a.qty for a in r.allocs if a.source_type == "transfer_line" and a.source_id == t.id)
-        if t.qty - used > 0:
-            opts.append({
-                "source_type": "transfer_line", "source_id": t.id,
-                "label": f"Transfer {snap.warehouses[t.source_warehouse_id].code}→{snap.warehouses[t.dest_warehouse_id].code}",
-                "destination": _wh(snap, t.dest_warehouse_id), "compatible": t.dest_warehouse_id == wo.warehouse_id,
-                "unallocated": t.qty - used, "expected_arrivals": [t.expected_arrival], "kind": "on_order",
-                "arrives_after_start": bool(t.expected_arrival and t.expected_arrival > wo.production_start_date),
-            })
-    for rec in snap.inventory.values():
-        if rec.part_id != item.part_id or not snap.is_free_stock(rec):
-            continue
-        free = snap.free_qty(rec, r.allocs)
-        if free > 0:
-            opts.append({
-                "source_type": "inventory", "source_id": rec.id,
-                "label": f"Stock {snap.warehouses[rec.warehouse_id].code} · {rec.location}",
-                "destination": _wh(snap, rec.warehouse_id), "compatible": rec.warehouse_id == wo.warehouse_id,
-                "unallocated": free, "expected_arrivals": [], "kind": "in_stock", "arrives_after_start": False,
-            })
-    opts.sort(key=lambda o: (not o["compatible"], o["kind"] != "in_stock"))
-    return opts
-
-
-def _other_demand(snap: Snapshot, r: Readiness, part_id: str, exclude_item: str) -> list[dict]:
-    out = []
-    for ir in r.items.values():
-        if ir.part_id != part_id or ir.item_id == exclude_item:
-            continue
-        wo = snap.work_orders[ir.work_order_id]
-        if wo.state == "canceled":
-            continue
-        out.append({"work_order_item_id": ir.item_id, "work_order_id": wo.id, "work_order_number": wo.number,
-                    "state": wo.state, "warehouse": _wh(snap, wo.warehouse_id),
-                    "production_start_date": wo.production_start_date, "required": ir.required,
-                    "uncovered": ir.uncovered if wo.state == "finalized" else ir.required})
-    return sorted(out, key=lambda x: x["production_start_date"])
+ISSUE_LABELS = {
+    "qa_rejection": "QA rejection", "supply_deficit": "Short delivery", "over_receipt": "Over-receipt",
+    "unmatched_receipt": "Unmatched receipt", "picking_discrepancy": "Missing stock", "demand_change": "Demand change",
+}
 
 
 def _exception_dict(snap: Snapshot, e) -> dict:
@@ -151,8 +111,8 @@ def _exception_dict(snap: Snapshot, e) -> dict:
                       "production_start_date": wo.production_start_date, "claimed_qty": l.claimed_qty,
                       "part_number": snap.parts[item.part_id].part_number})
     return {
-        "id": e.id, "type": e.type, "state": e.state, "title": e.title, "detail": e.detail,
-        "source_type": e.source_type, "source_id": e.source_id, "affected_qty": e.affected_qty,
+        "id": e.id, "type": e.type, "label": ISSUE_LABELS.get(e.type, e.type), "state": e.state, "title": e.title,
+        "detail": e.detail, "source_type": e.source_type, "source_id": e.source_id, "affected_qty": e.affected_qty,
         "blocking": e.blocking, "owner_role": e.owner_role, "raised_by": e.raised_by, "created_at": e.created_at,
         "resolution_note": e.resolution_note, "closed_at": e.closed_at,
         "part_number": snap.parts[e.part_id].part_number if e.part_id else None,
@@ -169,12 +129,12 @@ def work_order_detail(db: Session, wo_id: str) -> dict:
     for item in snap.items_by_wo.get(wo.id, []):
         ir = r.items[item.id]
         d = asdict(ir)
-        d["other_demand"] = _other_demand(snap, r, item.part_id, item.id)
-        d["supply_options"] = _supply_options(snap, r, item, wo) if wo.state != "canceled" else []
+        d["situations"] = [{**s, "action": _enrich(snap, s["action"])} for s in ir.situations]
+        d["situation"] = d["situations"][0]
+        d["action"] = d["situation"]["action"]
+        d["needs_attention"] = d["action"] is not None
         if wo.state == "draft":
-            d["local_free_stock"] = sum(snap.free_qty(rec, r.allocs) for rec in snap.inventory.values()
-                                        if rec.part_id == item.part_id and rec.warehouse_id == wo.warehouse_id
-                                        and snap.is_free_stock(rec))
+            d["available_to_allocate"] = sum(q for _, q in _free_stock(snap, r, item.part_id, wo.warehouse_id))
         items.append(d)
     exc_ids = {eid for i in items for eid in i["exceptions"]}
     hist_ids = {wo.id} | {i["item_id"] for i in items} | {s["allocation_id"] for i in items for s in i["sources"]}
@@ -193,13 +153,38 @@ def work_order_detail(db: Session, wo_id: str) -> dict:
     }
 
 
+HISTORY_LABELS = {
+    "work_order.create": "Work order created", "work_order.finalize": "Finalized; local stock allocated",
+    "work_order.cancel": "Canceled", "allocation.release": "Allocation released",
+    "allocation.review_flag": "Allocation decision flag changed", "fixture.review": "Fixture coverage recorded",
+    "exception.raise": "Issue raised", "exception.close": "Issue closed", "exception.note": "Issue note added",
+    "arrival.update": "Expected arrival updated", "scenario.apply": "Allocation plan applied",
+}
+
+
+def _history_text(h: ChangeHistory) -> str:
+    """A readable sentence instead of raw before/after JSON."""
+    a, b = h.after or {}, h.before or {}
+    if h.action == "allocation.create":
+        text = f"Allocated {a.get('qty')}" + (" (stock at another site)" if a.get("state") == "remote_hold" else "")
+    elif h.action == "allocation.reduce":
+        text = f"Allocation reduced from {b.get('qty')} to {a.get('qty')}"
+    elif h.action == "work_order_item.reduce":
+        text = f"Requirement reduced from {b.get('required_qty')} to {a.get('required_qty')}"
+    elif h.action == "arrival.update":
+        text = f"Expected arrival {b.get('expected_arrival') or 'unknown'} → {a.get('expected_arrival') or 'unknown'}"
+    else:
+        text = HISTORY_LABELS.get(h.action, h.action.replace("_", " ").replace(".", ": "))
+    return f"{text} — {h.note}" if h.note and h.note not in text else text
+
+
 def _history_dict(h: ChangeHistory) -> dict:
     return {"id": h.id, "at": h.at, "actor": h.actor, "role": h.role, "channel": h.channel,
             "entity_type": h.entity_type, "entity_id": h.entity_id, "action": h.action,
-            "before": h.before, "after": h.after, "note": h.note}
+            "summary": _history_text(h), "note": h.note}
 
 
-# ---------------------------------------------------------------- purchasing
+# ---------------------------------------------------------------- purchasing: three decision queues (PRD §4.17)
 
 
 def _replenishment(db: Session, snap: Snapshot, r: Readiness) -> list[dict]:
@@ -218,183 +203,192 @@ def _replenishment(db: Session, snap: Snapshot, r: Readiness) -> list[dict]:
         target = pol.target_level if pol else part.default_target_level
         if reorder is None or target is None:
             continue
-        free = sum(snap.free_qty(rec, r.allocs) for rec in snap.inventory.values()
-                   if rec.part_id == part_id and rec.warehouse_id == wh_id and snap.is_free_stock(rec))
-        incoming, etas = 0, []
-        for lid, line in snap.lines.items():
-            po = snap.pos[line.po_id]
-            if line.part_id == part_id and po.destination_warehouse_id == wh_id and po.status == "open":
-                q = r.line_quantities[lid]
-                if q.unallocated:
-                    incoming += q.unallocated
-                    etas += [b.eta for b in q.buckets if not b.arrived]
+        free = sum(q for _, q in _free_stock(snap, r, part_id, wh_id))
+        incoming = sum(r.line_quantities[lid].unallocated for lid, line in snap.lines.items()
+                       if line.part_id == part_id and snap.pos[line.po_id].destination_warehouse_id == wh_id
+                       and snap.pos[line.po_id].status == "open")
         projected = free + incoming
         if projected >= reorder:
             continue
-        out.append({
+        out.append({"part_id": part_id, "warehouse_id": wh_id, "available_to_allocate": free,
+                    "unallocated_on_order": incoming, "reorder_point": reorder, "target_level": target,
+                    "suggested_qty": target - projected})
+    return out
+
+
+def _requirement_row(snap: Snapshot, ir) -> dict:
+    wo = snap.work_orders[ir.work_order_id]
+    holds = [s for s in ir.sources if s.category == "remote_hold"]
+    reasons = (["short"] if ir.uncovered else []) + (["stock_at_other_site"] if ir.remote_hold else [])
+    return {
+        "work_order_item_id": ir.item_id, "work_order_id": wo.id, "work_order_number": wo.number,
+        "work_order_title": wo.title, "created_at": wo.created_at, "production_start_date": wo.production_start_date,
+        "warehouse": _wh(snap, wo.warehouse_id), "part_id": ir.part_id, "part_number": ir.part_number,
+        "description": ir.description, "supplier": _supplier(snap, ir.part_id), "required": ir.required,
+        "short": ir.uncovered, "at_other_site": ir.remote_hold, "reasons": reasons,
+        "remote_holds": [{"allocation_id": s.allocation_id, "qty": s.qty, "warehouse": _wh(snap, s.warehouse)}
+                         for s in holds],
+    }
+
+
+def _source_material(db: Session, snap: Snapshot, r: Readiness) -> dict:
+    """Short requirements, stock-at-another-site decisions, and replenishment, by part and destination."""
+    rows = []
+    for ir in r.items.values():
+        if snap.work_orders[ir.work_order_id].state == "finalized" and (ir.uncovered or ir.remote_hold):
+            rows.append(_requirement_row(snap, ir))
+    rows.sort(key=lambda x: (x["production_start_date"], x["work_order_number"]))
+    groups: dict[tuple, dict] = {}
+
+    def group(part_id, wh_id):
+        part = snap.parts[part_id]
+        return groups.setdefault((part_id, wh_id), {
             "part_id": part_id, "part_number": part.part_number, "description": part.description,
-            "warehouse": _wh(snap, wh_id), "free_on_hand": free, "incoming_unallocated": incoming,
-            "projected": projected, "reorder_point": reorder, "target_level": target,
-            "suggested_qty": target - projected, "lead_time_days": part.lead_time_days,
-            "policy_source": "warehouse" if pol else "company default",
-            "next_incoming": min((e for e in etas if e), default=None),
-            "preferred_supplier": snap.suppliers[part.preferred_supplier_id].name if part.preferred_supplier_id else None,
+            "warehouse": _wh(snap, wh_id), "supplier": _supplier(snap, part_id), "lead_time_days": part.lead_time_days,
+            "short": 0, "at_other_site": 0, "replenishment": 0, "reasons": [], "requirements": [],
+            "available_to_allocate": sum(q for _, q in _free_stock(snap, r, part_id, wh_id)),
+            "unallocated_on_order": sum(r.line_quantities[lid].unallocated for lid, line in snap.lines.items()
+                                        if line.part_id == part_id and snap.pos[line.po_id].status == "open"
+                                        and snap.pos[line.po_id].destination_warehouse_id == wh_id),
         })
+
+    for row in rows:
+        g = group(row["part_id"], row["warehouse"]["id"])
+        g["short"] += row["short"]
+        g["at_other_site"] += row["at_other_site"]
+        g["requirements"].append(row)
+        g["reasons"] = sorted(set(g["reasons"]) | set(row["reasons"]))
+    for rep in _replenishment(db, snap, r):
+        g = group(rep["part_id"], rep["warehouse_id"])
+        g["replenishment"] = rep["suggested_qty"]
+        g["reasons"] = sorted(set(g["reasons"]) | {"replenishment"})
+    out = []
+    for g in groups.values():
+        g["to_source"] = g["short"] + g["at_other_site"] + g["replenishment"]
+        g["earliest_start"] = g["requirements"][0]["production_start_date"] if g["requirements"] else None
+        out.append(g)
+    out.sort(key=lambda g: (g["earliest_start"] is None, g["earliest_start"] or snap.today, g["part_number"]))
+    return {"groups": out, "requirements": rows}
+
+
+def sourcing_options(db: Session, part_id: str, warehouse_id: str) -> dict:
+    """Everything that could cover one part at one destination, for the Source material panel (PRD §4.2)."""
+    snap, r = _load(db)
+    if part_id not in snap.parts or warehouse_id not in snap.warehouses:
+        raise NotFound("Part or warehouse not found")
+    part = snap.parts[part_id]
+    requirements = [_requirement_row(snap, ir) for ir in r.items.values()
+                    if ir.part_id == part_id and snap.work_orders[ir.work_order_id].state == "finalized"
+                    and snap.work_orders[ir.work_order_id].warehouse_id == warehouse_id and (ir.uncovered or ir.remote_hold)]
+    requirements.sort(key=lambda x: x["production_start_date"])
+    local = [{"source_type": "inventory", "source_id": rec.id, "label": f"{snap.warehouses[rec.warehouse_id].code} · {rec.location}",
+              "lot": rec.lot, "qty": free} for rec, free in _free_stock(snap, r, part_id, warehouse_id)]
+    on_order = []
+    for lid, line in snap.lines.items():
+        po = snap.pos[line.po_id]
+        q = r.line_quantities[lid]
+        if line.part_id != part_id or po.destination_warehouse_id != warehouse_id or po.status != "open" or q.unallocated <= 0:
+            continue
+        etas = sorted({b.eta for b in q.buckets if not b.arrived}, key=lambda d: (d is None, d))
+        on_order.append({"source_type": "po_line", "source_id": lid, "label": snap.line_label(lid), "po_id": po.id,
+                         "supplier": snap.suppliers[po.supplier_id].name, "qty": q.unallocated,
+                         "expected_arrival": etas[0] if len(etas) == 1 else None, "multiple_arrivals": len(etas) > 1})
+    transfers = []
+    for t in snap.transfers.values():
+        used = sum(a.qty for a in r.allocs if a.source_type == "transfer_line" and a.source_id == t.id)
+        if t.part_id == part_id and t.dest_warehouse_id == warehouse_id and t.status in ("planned", "in_transit") and t.qty > used:
+            transfers.append({"source_type": "transfer_line", "source_id": t.id, "label": f"Transfer from {snap.warehouses[t.source_warehouse_id].name}",
+                              "qty": t.qty - used, "expected_arrival": t.expected_arrival})
+    other_sites = []
+    for wh_id in snap.warehouses:
+        if wh_id == warehouse_id:
+            continue
+        for rec, free in _free_stock(snap, r, part_id, wh_id):
+            other_sites.append({"inventory_record_id": rec.id, "warehouse": _wh(snap, wh_id), "qty": free})
+    replenishment = next((x["suggested_qty"] for x in _replenishment(db, snap, r)
+                          if x["part_id"] == part_id and x["warehouse_id"] == warehouse_id), 0)
+    return {
+        "part": {"id": part.id, "part_number": part.part_number, "description": part.description, "uom": part.uom,
+                 "lead_time_days": part.lead_time_days},
+        "warehouse": _wh(snap, warehouse_id), "supplier": _supplier(snap, part_id),
+        "requirements": requirements, "available_to_allocate": local, "on_order": on_order + transfers,
+        "other_sites": other_sites, "replenishment": replenishment,
+    }
+
+
+def _arrival_targets(snap: Snapshot, r: Readiness, po) -> list[dict]:
+    """The shipment and unshipped PO-line quantities whose expected arrival a supplier update can change."""
+    out = []
+    for line in snap.lines_by_po[po.id]:
+        q = r.line_quantities[line.id]
+        part = snap.parts[line.part_id]
+        for qty_open, eta, number, sh_id in snap.open_shipments(line.id):
+            sh = snap.shipments[sh_id]
+            if qty_open > 0 and sh.status != "arrived":
+                out.append({"target_type": "shipment", "target_id": sh_id, "label": f"{number} · {part.part_number}",
+                            "qty": qty_open, "expected_arrival": eta, "basis": sh.arrival_basis})
+        if q.unshipped > 0:
+            out.append({"target_type": "po_line", "target_id": line.id, "label": f"{snap.line_label(line.id)} not yet shipped · {part.part_number}",
+                        "qty": q.unshipped, "expected_arrival": line.expected_arrival, "basis": line.arrival_basis})
+    return out
+
+
+def _supplier_follow_up(snap: Snapshot, r: Readiness) -> list[dict]:
+    """One item per PO, with every reason it needs supplier contact (PRD §4.15, §4.17)."""
+    reasons_by_po: dict[str, list[dict]] = defaultdict(list)
+    for t in snap.checkins:
+        status = _checkin_status(snap, t.due_date)
+        if t.state == "open" and status != "upcoming":
+            reasons_by_po[t.po_id].append({"type": "check_in", "status": status, "date": t.due_date,
+                                           "task_id": t.id, "note": t.note})
+    for ir in r.items.values():
+        wo = snap.work_orders[ir.work_order_id]
+        for s in ir.situations:
+            a = s["action"] or {}
+            if s["kind"] in ("arrives_late", "arrival_unknown") and a.get("po_id"):
+                reasons_by_po[a["po_id"]].append({
+                    "type": "late_arrival" if s["kind"] == "arrives_late" else "unknown_arrival",
+                    "qty": s["qty"], "date": s["date"], "part_number": ir.part_number,
+                    "work_order_id": wo.id, "work_order_number": wo.number,
+                    "production_start_date": wo.production_start_date,
+                    "target_type": a["target_type"], "target_id": a["target_id"]})
+    for po in snap.pos.values():
+        if po.needs_review:
+            reasons_by_po[po.id].append({"type": "po_review", "note": po.review_note})
+    order = {"late_arrival": 0, "check_in": 1, "unknown_arrival": 2, "po_review": 3}
+    out = []
+    for po_id, reasons in reasons_by_po.items():
+        po = snap.pos[po_id]
+        reasons.sort(key=lambda x: order[x["type"]])
+        open_checkins = [t for t in snap.checkins if t.po_id == po.id and t.state == "open"]
+        out.append({
+            "po_id": po.id, "po_number": po.number, "supplier": snap.suppliers[po.supplier_id].name,
+            "destination": _wh(snap, po.destination_warehouse_id), "reasons": reasons,
+            "next_checkin": min((t.due_date for t in open_checkins), default=None),
+            "open_checkin_ids": [t.id for t in open_checkins if _checkin_status(snap, t.due_date) != "upcoming"],
+            "earliest_start": min((x["production_start_date"] for x in reasons if x.get("production_start_date")), default=None),
+            "targets": _arrival_targets(snap, r, po), "needs_review": po.needs_review,
+        })
+    out.sort(key=lambda x: (order[x["reasons"][0]["type"]], x["earliest_start"] is None, x["earliest_start"] or snap.today))
     return out
 
 
 def purchasing_queue(db: Session) -> dict:
     snap, r = _load(db)
-    finalized = {w.id for w in snap.work_orders.values() if w.state == "finalized"}
-
-    def wo_ref(item_id):
-        item = snap.items[item_id]
-        wo = snap.work_orders[item.work_order_id]
-        return {"work_order_id": wo.id, "work_order_number": wo.number, "work_order_title": wo.title,
-                "production_start_date": wo.production_start_date, "warehouse": _wh(snap, wo.warehouse_id),
-                "work_order_item_id": item.id, "part_id": item.part_id,
-                "part_number": snap.parts[item.part_id].part_number}
-
-    uncovered, timing = [], []
-    for ir in r.items.values():
-        if ir.work_order_id not in finalized:
-            continue
-        item = snap.items[ir.item_id]
-        wo = snap.work_orders[ir.work_order_id]
-        if ir.uncovered:
-            opts = _supply_options(snap, r, item, wo)
-            uncovered.append({**wo_ref(ir.item_id), "required": ir.required, "uncovered": ir.uncovered,
-                              "options": opts, "supplier": _supplier(snap, ir.part_id),
-                              "unassigned_here": _assignable(snap, r, ir.part_id, wo.warehouse_id),
-                              "other_demand": [d for d in _other_demand(snap, r, ir.part_id, ir.item_id)
-                                               if d["uncovered"] > 0]})
-        if ir.timing in ("late", "timing_review", "unknown"):
-            timing.append({**wo_ref(ir.item_id), "timing": ir.timing, "late_qty": ir.late_qty,
-                           "supplier": _supplier(snap, ir.part_id),
-                           "sources": [asdict(s) for s in ir.sources if s.category == "incoming"]})
-
-    remote_holds = []
-    for a in r.allocs:
-        if a.state == "remote_hold":
-            rec = snap.inventory[a.source_id]
-            ir = r.items[a.item_id]
-            remote_holds.append({**wo_ref(a.item_id), "allocation_id": a.id, "qty": a.qty, "required": ir.required,
-                                 "supplier": _supplier(snap, rec.part_id),
-                                 "source_warehouse": _wh(snap, rec.warehouse_id),
-                                 "competing_demand": [d for d in _other_demand(snap, r, rec.part_id, a.item_id)
-                                                      if d["warehouse"]["id"] == rec.warehouse_id]})
-
+    source = _source_material(db, snap, r)
+    follow_up = _supplier_follow_up(snap, r)
     drafts = {s.po_line_id: s.id for s in db.scalars(select(PlanningScenario).where(PlanningScenario.state == "draft"))}
-    shortages = [{**s, "draft_scenario_id": drafts.get(s["po_line_id"])} for s in material_shortages(snap, r)]
-
-    handoffs = []
-    for lid, q in r.line_quantities.items():
-        claims = [a for a in r.allocs if a.source_type == "po_line" and a.source_id == lid]
-        if q.pooled_accepted and claims and not any(a.review for a in claims):
-            handoffs.append({"po_line_id": lid, "po_id": snap.lines[lid].po_id, "label": snap.line_label(lid),
-                             "part_number": snap.parts[snap.lines[lid].part_id].part_number,
-                             "accepted_waiting": q.pooled_accepted,
-                             "claims": [{**wo_ref(a.item_id), "allocation_id": a.id, "qty": a.qty} for a in claims]})
-
-    checkins = []
-    for t in snap.checkins:
-        if t.state != "open":
-            continue
-        po = snap.pos[t.po_id]
-        lines = [t.po_line_id] if t.po_line_id else [l.id for l in snap.lines_by_po[po.id]]
-        arrivals = sorted({b.eta for lid in lines for b in r.line_quantities[lid].buckets
-                           if not b.arrived and b.eta}, key=lambda d: d)
-        checkins.append({"id": t.id, "po_id": po.id, "po_number": po.number, "po_line_id": t.po_line_id,
-                         "supplier": snap.suppliers[po.supplier_id].name, "due_date": t.due_date,
-                         "status": _checkin_status(snap, t.due_date), "owner": t.owner, "note": t.note,
-                         "expected_arrivals": arrivals})
-
-    pos_review = [{"id": p.id, "number": p.number, "supplier": snap.suppliers[p.supplier_id].name,
-                   "review_note": p.review_note} for p in snap.pos.values() if p.needs_review]
-    exceptions = [_exception_dict(snap, e) for e in snap.exceptions.values() if e.state != "closed"]
-    replenishment = _replenishment(db, snap, r)
-
+    allocate = [{**s, "draft_scenario_id": drafts.get(s["po_line_id"])} for s in allocation_decisions(snap, r)]
     return {
         "today": snap.today,
-        "counts": {"uncovered": len(uncovered), "remote_holds": len(remote_holds), "shortages": len(shortages),
-                   "timing": len(timing), "checkins_due": sum(c["status"] != "upcoming" for c in checkins),
-                   "exceptions": len(exceptions), "pos_review": len(pos_review), "handoffs": len(handoffs),
-                   "replenishment": len(replenishment)},
-        "uncovered": sorted(uncovered, key=lambda x: x["production_start_date"]),
-        "remote_holds": remote_holds,
-        "material_shortages": shortages,
-        "handoffs": handoffs,
-        "timing_conflicts": sorted(timing, key=lambda x: x["production_start_date"]),
-        "checkins": checkins,
-        "pos_needing_review": pos_review,
-        "exceptions": exceptions,
-        "replenishment": replenishment,
+        "counts": {"source_material": len(source["groups"]), "supplier_follow_up": len(follow_up),
+                   "allocate_material": len(allocate),
+                   "issues": sum(e.state != "closed" for e in snap.exceptions.values()),
+                   "pos_review": sum(p.needs_review for p in snap.pos.values())},
+        "source_material": source,
+        "supplier_follow_up": follow_up,
+        "allocate_material": allocate,
     }
-
-
-def parts_view(db: Session) -> list[dict]:
-    """Per part: can current stock and open orders meet every finalized requirement, and what closes the gap?"""
-    snap, r = _load(db)
-    out = []
-    for part in sorted(snap.parts.values(), key=lambda p: p.part_number):
-        rows = []
-        for ir in r.items.values():
-            wo = snap.work_orders[ir.work_order_id]
-            if ir.part_id != part.id or wo.state != "finalized":
-                continue
-            rows.append({
-                "work_order_item_id": ir.item_id, "work_order_id": wo.id, "work_order_number": wo.number,
-                "warehouse": _wh(snap, wo.warehouse_id), "production_start_date": wo.production_start_date,
-                "required": ir.required, "from_stock": ir.available, "on_order": ir.incoming,
-                "at_other_site": ir.remote_hold, "decision_needed": ir.review, "short": ir.uncovered,
-                "expected": ir.expected, "state": ir.state, "action": ir.action,
-                "sources": [{"label": s.label, "qty": s.qty, "category": s.category, "expected_arrival": s.expected_arrival,
-                             "po_id": s.po_id} for s in ir.sources],
-            })
-        rows.sort(key=lambda x: x["production_start_date"])
-        line_short = sum(q.deficit for lid, q in r.line_quantities.items() if snap.lines[lid].part_id == part.id)
-        needed = sum(x["required"] for x in rows)
-        gap = sum(x["short"] for x in rows) + line_short
-        by_site: dict[str, list] = defaultdict(list)
-        for x in rows:
-            if x["short"]:
-                by_site[x["warehouse"]["id"]].append(x)
-        purchases = []
-        for wh_id, xs in by_site.items():
-            purchases.append({
-                "destination": _wh(snap, wh_id), "short": sum(x["short"] for x in xs),
-                "unassigned_here": _assignable(snap, r, part.id, wh_id),
-                "demand": [{"work_order_item_id": x["work_order_item_id"], "work_order_id": x["work_order_id"],
-                            "work_order_number": x["work_order_number"], "state": "finalized", "warehouse": x["warehouse"],
-                            "production_start_date": x["production_start_date"], "required": x["required"],
-                            "uncovered": x["short"]} for x in xs],
-            })
-        unassigned = sum(p["unassigned_here"] for p in purchases)
-        states = {x["state"] for x in rows}
-        if gap and unassigned >= gap and not line_short:
-            verdict = "assign_existing"
-        elif gap:
-            verdict = "short"
-        elif states & {"arrives_late", "arrival_unknown", "transfer_decision"}:
-            verdict = "at_risk"
-        elif rows:
-            verdict = "covered"
-        else:
-            verdict = "no_demand"
-        free_stock = sum(snap.free_qty(rec, r.allocs) for rec in snap.inventory.values()
-                         if rec.part_id == part.id and snap.is_free_stock(rec))
-        if not rows and not free_stock:
-            continue
-        out.append({
-            "id": part.id, "part_number": part.part_number, "description": part.description, "uom": part.uom,
-            "lead_time_days": part.lead_time_days, "supplier": _supplier(snap, part.id),
-            "orders": len(rows), "needed": needed, "covered": needed - gap, "gap": gap,
-            "late_qty": sum(r.items[x["work_order_item_id"]].late_qty for x in rows),
-            "verdict": verdict, "free_stock": free_stock, "requirements": rows, "purchases": purchases,
-        })
-    order = {"short": 0, "assign_existing": 1, "at_risk": 2, "covered": 3, "no_demand": 4}
-    out.sort(key=lambda p: (order[p["verdict"]], p["part_number"]))
-    return out
 
 
 def _inventory_rollup(snap: Snapshot, r: Readiness, part_id: str | None = None) -> list[dict]:
@@ -469,6 +463,24 @@ def purchase_order(db: Session, po_id: str) -> dict:
     return _po_dict(snap, r, po, detail=True)
 
 
+def _line_issue(snap: Snapshot, r: Readiness, line, q, claims: list[dict]) -> str | None:
+    """The one issue worth showing in the PO line table; details live in the expanded row."""
+    if q.deficit:
+        return f"Short {q.deficit} against allocations"
+    if q.pooled_accepted and len(claims) > 1:
+        return f"{q.pooled_accepted} received — allocation decision needed"
+    late = sum(c["late_qty"] for c in claims)
+    if late:
+        return f"{late} arrive after production start"
+    if any(c["timing"] == "unknown" for c in claims):
+        return "Arrival date unknown"
+    if q.pooled_pending:
+        return f"{q.pooled_pending} awaiting QA"
+    if any(b.stage == "awaiting_receipt" for b in q.buckets):
+        return "Arrived — awaiting receipt"
+    return None
+
+
 def _po_dict(snap: Snapshot, r: Readiness, po, detail: bool = False) -> dict:
     lines = []
     for line in snap.lines_by_po[po.id]:
@@ -492,13 +504,16 @@ def _po_dict(snap: Snapshot, r: Readiness, po, detail: bool = False) -> dict:
                               "expected_arrival": sh.expected_arrival, "arrival_basis": sh.arrival_basis,
                               "arrival_channel": sh.arrival_channel, "arrival_updated_at": sh.arrival_updated_at,
                               "carrier": sh.carrier, "tracking_number": sh.tracking_number, "carrier_eta": sh.carrier_eta})
+        etas = sorted({b.eta for b in q.buckets if not b.arrived}, key=lambda d: (d is None, d))
         lines.append({
             "id": line.id, "line_no": line.line_no, "label": snap.line_label(line.id), "part_id": part.id,
             "part_number": part.part_number, "description": part.description, "uom": part.uom,
             "ordered": q.ordered, "canceled": q.canceled, "closed_shortfall": q.shortfall, "received": q.received,
             "outstanding": q.outstanding, "in_transit": q.in_transit, "unshipped": q.unshipped,
-            "pending_qa": q.pooled_pending, "awaiting_handoff": q.pooled_accepted, "claims": q.claims,
+            "awaiting_qa": q.pooled_pending, "received_unassigned": q.pooled_accepted, "allocated": q.claims,
             "unallocated": q.unallocated, "deficit": q.deficit,
+            "next_arrival": etas[0] if len(etas) == 1 else None, "multiple_arrivals": len(etas) > 1,
+            "issue": _line_issue(snap, r, line, q, claims),
             "expected_arrival": line.expected_arrival, "arrival_basis": line.arrival_basis,
             "arrival_channel": line.arrival_channel, "arrival_updated_at": line.arrival_updated_at,
             "supplier_promised_date": line.supplier_promised_date, "acknowledged_at": line.acknowledged_at,
@@ -518,6 +533,8 @@ def _po_dict(snap: Snapshot, r: Readiness, po, detail: bool = False) -> dict:
                             "note": t.note, "state": t.state, "outcome": t.outcome, "completed_at": t.completed_at,
                             "status": _checkin_status(snap, t.due_date) if t.state == "open" else "completed"}
                            for t in snap.checkins if t.po_id == po.id]
+        out["arrival_targets"] = _arrival_targets(snap, r, po)
+        out["open_checkin_ids"] = [t.id for t in open_checkins if _checkin_status(snap, t.due_date) != "upcoming"]
     return out
 
 
@@ -608,7 +625,7 @@ def warehouse_queue(db: Session, warehouse_id: str | None = None) -> dict:
                 "production_start_date": wo.production_start_date,
                 "days_to_start": (wo.production_start_date - snap.today).days, "part_number": part.part_number,
                 "description": part.description, "uom": part.uom, "qty": a.qty, "location": rec.location,
-                "lot": rec.lot, "blocked": a.review, "blocked_reason": "Allocation review required" if a.review else None}
+                "lot": rec.lot, "blocked": a.review, "blocked_reason": "Allocation decision needed" if a.review else None}
         if rec.stage in ("received", "stored"):
             picks.append(task)
         elif rec.stage == "picked":

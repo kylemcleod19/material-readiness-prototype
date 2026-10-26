@@ -10,20 +10,14 @@ import { ExceptionsPage } from "@/pages/ExceptionsPage";
 import { NewWorkOrderPage } from "@/pages/planning/NewWorkOrderPage";
 import { WorkOrderDetailPage } from "@/pages/planning/WorkOrderDetailPage";
 import { WorkOrdersPage } from "@/pages/planning/WorkOrdersPage";
-import { PartsPage } from "@/pages/purchasing/PartsPage";
 import { PurchaseOrderPage } from "@/pages/purchasing/PurchaseOrderPage";
 import { PurchaseOrdersPage } from "@/pages/purchasing/PurchaseOrdersPage";
-import { CheckInsPage } from "@/pages/purchasing/CheckInsPage";
-import { HandoffsPage } from "@/pages/purchasing/HandoffsPage";
-import { InventoryPlanningPage } from "@/pages/purchasing/InventoryPlanningPage";
-import { ReplenishmentPage } from "@/pages/purchasing/ReplenishmentPage";
-import { MaterialShortagesPage } from "@/pages/purchasing/MaterialShortagesPage";
-import { TimingPage } from "@/pages/purchasing/TimingPage";
-import { PurchasingQueuePage } from "@/pages/purchasing/PurchasingQueuePage";
+import { SourceMaterialPage } from "@/pages/purchasing/SourceMaterialPage";
+import { SupplierFollowUpPage } from "@/pages/purchasing/SupplierFollowUpPage";
+import { AllocateMaterialPage } from "@/pages/scenarios/AllocateMaterialPage";
 import { QAQueuePage } from "@/pages/qa/QAQueuePage";
 import { QATaskPage } from "@/pages/qa/QATaskPage";
 import { ScenarioPage } from "@/pages/scenarios/ScenarioPage";
-import { SharedShortagesPage } from "@/pages/scenarios/SharedShortagesPage";
 import { ArrivalsPage } from "@/pages/warehouse/ArrivalsPage";
 import { InventoryPage } from "@/pages/warehouse/InventoryPage";
 import { PickTaskPage } from "@/pages/warehouse/PickTaskPage";
@@ -51,18 +45,12 @@ const router = createBrowserRouter([
       { path: "/work-orders", element: <WorkOrdersPage /> },
       { path: "/work-orders/new", element: <NewWorkOrderPage /> },
       { path: "/work-orders/:id", element: <WorkOrderDetailPage /> },
-      { path: "/shortages", element: <SharedShortagesPage /> },
+      { path: "/allocate", element: <AllocateMaterialPage /> },
       { path: "/scenarios/:id", element: <ScenarioPage /> },
       { path: "/exceptions", element: <ExceptionsPage /> },
-      { path: "/purchasing", element: <Navigate to="/purchasing/queue" replace /> },
-      { path: "/purchasing/shortages", element: <MaterialShortagesPage /> },
-      { path: "/purchasing/queue", element: <PurchasingQueuePage /> },
-      { path: "/purchasing/timing", element: <TimingPage /> },
-      { path: "/purchasing/inventory-planning", element: <InventoryPlanningPage /> },
-      { path: "/purchasing/checkins", element: <CheckInsPage /> },
-      { path: "/purchasing/handoffs", element: <HandoffsPage /> },
-      { path: "/purchasing/replenishment", element: <ReplenishmentPage /> },
-      { path: "/purchasing/parts", element: <PartsPage /> },
+      { path: "/purchasing", element: <Navigate to="/purchasing/source" replace /> },
+      { path: "/purchasing/source", element: <SourceMaterialPage /> },
+      { path: "/purchasing/follow-up", element: <SupplierFollowUpPage /> },
       { path: "/purchasing/pos", element: <PurchaseOrdersPage /> },
       { path: "/purchasing/pos/:id", element: <PurchaseOrderPage /> },
       { path: "/warehouse", element: <ArrivalsPage /> },

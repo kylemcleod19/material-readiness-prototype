@@ -247,6 +247,25 @@ def confirm_remote_hold(db: Session, actor: Actor, alloc_id: str, expected_arriv
     return {"transfer_line_id": t.id, "allocation_id": new.id}
 
 
+def hold_remote_stock(db: Session, actor: Actor, item_id: str, record_id: str, qty: int, op_id=None) -> Allocation:
+    """Allocate free stock at another site to a requirement, pending a transfer decision."""
+    item = lock(db, WorkOrderItem, item_id)
+    wo = get_or_404(db, WorkOrder, item.work_order_id)
+    if wo.state != "finalized":
+        raise DomainError("Supply can only be allocated to finalized work orders")
+    rec = lock(db, InventoryRecord, record_id)
+    if rec.part_id != item.part_id or rec.warehouse_id == wo.warehouse_id:
+        raise DomainError("Stock must be the same part at a different site")
+    eligible = (rec.quality_state == "accepted" and rec.stage in ("received", "stored")
+                and rec.pool_po_line_id is None and rec.reserved_transfer_line_id is None)
+    free = rec.qty - allocated_to_inventory(db, rec.id) if eligible else 0
+    need = item.required_qty - allocated_to_item(db, item.id)
+    if qty <= 0 or qty > min(free, need):
+        raise DomainError(f"Only {min(free, need)} can be taken from that site for this requirement")
+    return _new_allocation(db, actor, item.id, qty, "remote_hold", inventory_record_id=rec.id, op_id=op_id,
+                           note="stock at another site, for transfer")
+
+
 def release_remote_hold(db: Session, actor: Actor, alloc_id: str, op_id=None) -> dict:
     alloc = lock(db, Allocation, alloc_id)
     if alloc.state != "remote_hold":

@@ -15,6 +15,9 @@ class Bucket:
     eta: date | None
     arrived: bool = False
     label: str = ""
+    # Physical stage: unshipped | in_transit | awaiting_receipt (at the dock) | awaiting_qa | received
+    stage: str = "unshipped"
+    shipment_id: str | None = None
 
 
 @dataclass
@@ -56,31 +59,34 @@ def line_quantities(
     shortfall: int,
     expected_arrival: date | None,
     received: int,
-    open_shipments: list[tuple[int, date | None, str]],
+    open_shipments: list[tuple[int, date | None, str, str | None, bool]],
     pooled: list[tuple[int, str]],
     claims: int,
     include_pool: bool = True,
 ) -> LineQuantities:
     """Reconcile ordered - canceled - shortfall into disjoint unshipped / in-transit / received.
 
-    open_shipments: (qty shipped but not yet received, shipment expected arrival, label).
+    open_shipments: (qty shipped but not yet received, expected arrival, label, shipment id, at the dock).
     pooled: (qty, quality_state) of received records still pooled to the line.
     """
     outstanding = max(0, ordered - canceled - shortfall - received)
     buckets: list[Bucket] = []
     in_transit = 0
-    for qty_open, eta, label in open_shipments:
+    for qty_open, eta, label, shipment_id, at_dock in open_shipments:
         q = min(qty_open, outstanding - in_transit)
         if q > 0:
-            buckets.append(Bucket(q, eta, False, label))
+            # Material at the dock has physically arrived: an old ETA can no longer make it late.
+            buckets.append(Bucket(q, eta, at_dock, label, "awaiting_receipt" if at_dock else "in_transit", shipment_id))
             in_transit += q
     unshipped = outstanding - in_transit
     if unshipped > 0:
-        buckets.append(Bucket(unshipped, expected_arrival, False, "unshipped"))
+        buckets.append(Bucket(unshipped, expected_arrival, False, "unshipped", "unshipped"))
     pooled_pending = sum(q for q, s in pooled if s == "pending") if include_pool else 0
     pooled_accepted = sum(q for q, s in pooled if s == "accepted") if include_pool else 0
-    if pooled_pending + pooled_accepted:
-        buckets.append(Bucket(pooled_pending + pooled_accepted, None, True, "received"))
+    if pooled_pending:
+        buckets.append(Bucket(pooled_pending, None, True, "in QA", "awaiting_qa"))
+    if pooled_accepted:
+        buckets.append(Bucket(pooled_accepted, None, True, "received", "received"))
     return LineQuantities(
         ordered=ordered,
         canceled=canceled,

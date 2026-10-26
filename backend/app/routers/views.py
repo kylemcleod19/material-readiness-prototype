@@ -12,11 +12,6 @@ def purchasing_queue(db: Session = Depends(get_db)):
     return views.purchasing_queue(db)
 
 
-@router.get("/parts")
-def parts(db: Session = Depends(get_db)):
-    return views.parts_view(db)
-
-
 @router.get("/warehouse-queue")
 def warehouse_queue(warehouse_id: str | None = None, db: Session = Depends(get_db)):
     return views.warehouse_queue(db, warehouse_id)

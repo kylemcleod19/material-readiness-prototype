@@ -3,7 +3,7 @@
 State is built by calling the normal services, so seeded reservations and allocations obey
 the same rules as anything done in the UI.
 """
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -81,6 +81,11 @@ WORK_ORDERS = [
          warehouse_id="wh_west", production_start_date=D(2026, 12, 22), build_qty=10,
          items=[dict(id="woi_1008_1", part_id="prt_har200", required_qty=20)]),
 ]
+# When each work order was created upstream (fixed, before the demo date).
+CREATED = {
+    "wo_1001": (2026, 10, 2), "wo_1002": (2026, 10, 2), "wo_1003": (2026, 10, 9), "wo_1004": (2026, 10, 14),
+    "wo_1005": (2026, 11, 18), "wo_1006": (2026, 10, 27), "wo_1007": (2026, 11, 3), "wo_1008": (2026, 11, 10),
+}
 FINALIZE = ["wo_1001", "wo_1002", "wo_1003", "wo_1004", "wo_1006", "wo_1007", "wo_1008"]
 
 PURCHASE_ORDERS = [
@@ -145,7 +150,8 @@ def seed(db: Session) -> None:
     db.flush()
 
     for wo in WORK_ORDERS:
-        allocations.create_work_order(db, SEED, **wo)
+        created = allocations.create_work_order(db, SEED, **wo)
+        created.created_at = datetime(*CREATED[created.id], 15, 0, tzinfo=timezone.utc)
     for po in PURCHASE_ORDERS:
         purchasing.create_po(db, SEED, **po)
     for sh in SHIPMENTS:

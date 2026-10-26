@@ -29,16 +29,16 @@ The demo clock is fixed at **Nov 24, 2026** (`DEMO_TODAY`), so seeded due, overd
 
 ## Demo walkthrough
 
-Use the role switcher at the top of the side menu. Each menu item is one work list and shows its current count. It sets context only; it is not authentication. The **Demo** button runs the same steps through the normal services, and it also restores the seeded state.
+Use the role switcher at the top of the side menu. Purchasing has three work queues (Source material, Supplier follow-up, Allocate material) plus reference views; each queue shows its count of actionable items. It sets context only; it is not authentication. The **Demo** button runs the same steps through the normal services, and it also restores the seeded state.
 
-1. **Purchasing → Work orders → WO-1008 → Assign supply.** Assign 20 of PO-5002's 30 unallocated HAR-200. The line now has 10 unallocated. WO-1008 shows *On order*, not ready.
+1. **Purchasing → Source material → HAR-200 / West Assembly → Source material.** Allocate 20 of PO-5002's 30 unallocated on-order HAR-200 to WO-1008 and confirm. The panel shows what changed and that nothing is still short; WO-1008 is now on order, not kit ready. Toggle **By work order** to see one row per requirement with its created date.
 2. **Warehouse → Arrivals → SH-7001 → Receive.** Receive 100 ACT-100, which is shared by WO-1001/1002/1003 (40/30/30). The units are in QA and not available yet.
-3. **QA → Inspect.** Accept 80 and reject 20; the 20 are scrapped. Purchasing → **Material shortages** shows PO-5001-1 with 100 allocated, 80 available, short 20, and each linked work order shows *Shortage — decision needed*. No order has been chosen to absorb the shortfall. A purchasing exception lists all three orders.
-4. **Purchasing → Material shortages → Decide split.** Give 40/30/10 from available and click Preview. Only the preview shows WO-1003 short 20. Click Apply plan. Allocations change together, WO-1003 moves to the purchasing queue short 20, and the scrapped units never return to supply.
-5. **Warehouse → Pick.** Pick and stage WO-1001's 40 ACT-100. The stage changes, and the inventory total does not.
-6. **Purchasing → Check-ins.** PO-5003's Nov 23 check-in is overdue, which flags follow-up only. Complete it with a revised SH-7002 arrival of Dec 5. WO-1004 (start Dec 3) is now flagged late, and its production start does not change.
+3. **QA → Inspect.** Accept 80 and reject 20; the 20 are scrapped. **Allocate material** shows PO-5001-1 short 20 of 100 allocated with 80 available, and each linked work order shows *Allocation decision needed*. No order has been chosen to absorb the shortfall.
+4. **Allocate material → Allocate material.** Give 40/30/10 from available and click Preview. Only the preview shows WO-1003 short 20. Click Apply (it also closes the QA-rejection review). Allocations change together, WO-1003 moves to Source material short 20, and the scrapped units never return to supply.
+5. **WO-1001 → Pick and stage** (opens the pick list filtered to that order). Pick and stage its 40 ACT-100. The stage changes, and the inventory total does not.
+6. **Purchasing → Supplier follow-up → PO-5003 → Record supplier update.** The Nov 23 check-in is overdue, which flags follow-up only. In one dialog, record the note, change SH-7002 to Dec 5, and complete the check-in. WO-1004 (start Dec 3) is now at risk; its production start does not change and the PO stays in follow-up for the late arrival.
 
-Other paths you can try: the simulated supplier feed on a PO page, consolidated buying under **By part**, transferring stock from another site or buying instead (Inventory planning), fixture coverage review, cancelling a work order (unused allocations are released, the PO is flagged for review, staged material stays put), and reducing a requirement.
+Other paths you can try: the simulated supplier feed in the Demo panel, combining several work orders into one purchase from Source material, transferring stock from another site or choosing **Buy instead** (WO-1004 THP-400), replenishment as a Source material reason, fixture coverage review, cancelling a work order (unused allocations are released, the PO is flagged for review, staged material stays put), and reducing a requirement.
 
 Terminology (available, on order, allocated, short, scrapped, material shortage, outlook, next action) is defined in §1a of the PRD and used the same way in the UI and API.
 

@@ -212,3 +212,40 @@ def complete_checkin(db: Session, actor: Actor, task_id: str, outcome: str, new_
 
 def open_shipment_qty(db: Session, sl: ShipmentLine) -> int:
     return sl.qty - received_against_shipment_line(db, sl.id)
+
+
+def record_supplier_update(db: Session, actor: Actor, po_id: str, *, note: str, arrivals: list[dict],
+                           complete_checkin_ids: list[str], next_checkin: dict | None, mark_reviewed: bool,
+                           op_id=None) -> dict:
+    """One interaction for supplier follow-up (PRD §4.18): outcome note, revised arrivals for the chosen
+    shipments/PO lines, completion of the related check-ins, an optional next check-in, and PO review.
+
+    Production start is never changed; a later date leaves the conflict visible.
+    """
+    if not note or not note.strip():
+        raise DomainError("Record what the supplier said")
+    po = lock(db, PurchaseOrder, po_id)
+    line_ids = {l.id for l in db.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.po_id == po.id))}
+    for a in arrivals:
+        if a["target_type"] == "po_line":
+            ok = a["target_id"] in line_ids
+        else:
+            sh_lines = db.scalars(select(ShipmentLine).where(ShipmentLine.shipment_id == a["target_id"])).all()
+            ok = bool(sh_lines) and all(sl.po_line_id in line_ids for sl in sh_lines)
+        if not ok:
+            raise DomainError("Arrival update must target this PO's shipments or lines")
+        update_arrival(db, actor, target_type=a["target_type"], target_id=a["target_id"],
+                       expected_arrival=a.get("expected_arrival"), basis=a.get("basis", "supplier_promise"),
+                       note=note, op_id=op_id)
+    for task_id in complete_checkin_ids:
+        task = get_or_404(db, POCheckInTask, task_id)
+        if task.po_id != po.id:
+            raise DomainError("Check-in belongs to a different PO")
+        complete_checkin(db, actor, task_id, note, None, op_id)
+    if next_checkin and next_checkin.get("due_date"):
+        create_checkin(db, actor, po_id=po.id, po_line_id=None, due_date=next_checkin["due_date"], owner=actor.name,
+                       note=next_checkin.get("note"), op_id=op_id)
+    if mark_reviewed and po.needs_review:
+        clear_po_review(db, actor, po.id, note, op_id)
+    history.record(db, actor, po, "po.supplier_update", note=note, op_id=op_id)
+    return {"po_id": po.id}

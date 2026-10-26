@@ -1,7 +1,7 @@
 # Material Planning and Readiness — Concept PRD
 
 **Anduril take-home working document · October 25, 2026**  
-**Status:** Updated with scope and data-model decisions from the October 25 discussion. Selected prototype rules are distinguished from deferred concepts and proposed implementation defaults. Revised after the first prototype review: a single vocabulary (§1a); QA rejections are scrapped rather than held; screens show one status and next action per requirement (§5.4); renamed queues (Material shortages, Purchasing queue, Inventory planning queue).
+**Status:** Revised after terminology and repository workflow review. This revision preserves the accepted/scrapped QA simplification and consolidates purchasing decisions, removes repeated screen actions, and separates physical state, allocation, schedule outlook, and next action. These are implementation requirements for the next iteration, not claims that the app already behaves this way.
 
 ## 1. Purpose and source of requirements
 
@@ -13,25 +13,35 @@ The assignment prompt is authoritative. It describes difficulty tracking supplie
 
 Our selected framing connects inbound supply and inventory to production material readiness. Work orders, QA, reservations, and kit staging are design choices supporting that framing; they are not explicitly mandated by the prompt. Actual Anduril workflows, ERP configuration, and nuclear-specific requirements have not been established.
 
-## 1a. Terminology
+## 1a. Operational vocabulary
 
-The prototype uses one small vocabulary everywhere: in screens, records, and this document. Avoid synonyms.
+Use these labels consistently in the interface. Internal field names may remain different when mapped explicitly; a naming cleanup does not require unnecessary schema renames. Do not introduce a second user-facing term for the same concept.
 
-| Term | Meaning |
+| Term | Meaning and display rule |
 |---|---|
-| **Available** | Accepted material physically in inventory. Material is either available or it is not; there is no separate "usable" classification. |
-| **Staged** | Available material picked into a work order's kit. Staged quantity is part of available quantity, not added to it. |
-| **On order** | Supply not yet available: unshipped or in-transit PO quantity, inbound transfers, and received material still in QA inspection. |
-| **Allocated** | Quantity of a specific supply source (stock, PO line, or transfer) set aside for a specific work-order requirement. |
-| **Short** | Required quantity with no allocated supply. |
-| **Scrapped** | Quantity rejected at QA. It leaves inventory immediately and is never available; the scrap record keeps its receipt and PO links. |
-| **Material shortage** | A supply source whose allocations now exceed what it can deliver (for example after a QA rejection). It needs a decision about how to split the remaining supply. |
-| **Outlook** | Whether a work order can meet its production start: *Ready*, *On track*, *At risk*, or *Action needed*. |
-| **Next action** | The specific step that moves a requirement toward ready, such as buy, assign, decide a shortage, decide a transfer, update an arrival, or pick and stage. |
+| **Available** | Accepted material physically in inventory, including allocated, picked, and staged units. Does not mean free to assign to another order. Do not introduce a separate “usable” classification. |
+| **Available to allocate** | Accepted local stock not already allocated, staged, or reserved for transfer. Show this explicitly in sourcing decisions. |
+| **Unallocated on order** | Open incoming supply that is not assigned to a requirement. Keep separate from available stock; show quantity and expected arrival. |
+| **Allocated** | Supply set aside for a specific work-order requirement. Use this instead of alternating between committed/reserved/assigned as status labels. “Assign” is the action that creates an allocation. |
+| **On order** | Purchased supply not yet physically received. Use specific “In transit” detail when known. Inbound transfers display “Transfer in transit”; material already at the dock or in QA must not display as still arriving. |
+| **Awaiting receipt / Awaiting QA** | Material physically arrived but not yet accepted into available stock. The next action belongs to receiving/QA, not supplier date follow-up. |
+| **Picked / Staged** | Physical warehouse stages. Staged material is in the work order’s kit and remains part of available inventory, counted once. |
+| **Short** | A required quantity with no valid allocated supply. Show the quantity, such as “Short 20.” |
+| **Allocation decision needed** | Existing supply supports competing work orders and someone must decide who gets it. Show any total supply deficit once at the source; do not declare each work order short by that amount. |
+| **Stock at another site** | Potential supply or a provisional remote allocation requiring a transfer decision. It is not available locally. Avoid bare “hold.” |
+| **Scrapped** | Rejected QA quantity excluded from inventory balances. Preserve receipt/QA/PO history. Use “Reject and scrap” for the action; there is no quality-hold or use-as-is workflow. |
+| **Fully allocated** | All requirements have valid supply allocations. This does not imply arrival on time, acceptance, or kit readiness. Do not use bare “covered” as an overall verdict. |
+| **Kit ready** | All required material is accepted and staged, blocking issues are resolved, and manual fixture coverage is recorded. |
+| **Schedule outlook** | “On track,” “At risk,” or “Unknown,” calculated separately from task ownership and physical stage (§5.4). |
+| **Next action** | A concrete operation: Source material, Allocate material, Record supplier update, Receive, Inspect, Pick and stage, or Confirm fixture coverage. |
+
+Use “Short delivery,” “QA rejection,” or “Missing stock” to name an issue. “Exception” may describe the underlying record or history section, but is not a sufficient explanation or primary action label. Do not show “Receipt handoff,” “claims,” “uncovered,” or internal enum names as operator labels. Receiving-related reassignment is “Assign received material.”
+
+Physical state, allocation, and schedule are separate facts. A requirement can be fully allocated and still arrive late; a work order can need picking while remaining on track.
 
 ## 2. Product outcome and boundary
 
-Give teams a shared view of demand, the supply covering it, the remaining blockers, and known arrival-date conflicts against production start. Track actual usability and staging separately. Translate visibility into decisions: reserve, transfer, purchase, expedite, inspect, resolve an exception, or revise the production plan.
+Give teams a shared view of demand, the supply covering it, the remaining blockers, and known arrival-date conflicts against production start. Track actual availability and staging separately. Translate visibility into decisions: reserve, transfer, purchase, expedite, inspect, resolve an exception, or revise the production plan.
 
 The discussed workflow ends at **kit staged**. Physical production execution and component consumption are beyond this boundary. Staging must not automatically be treated as the accounting event that charges material to a work order.
 
@@ -41,7 +51,7 @@ The discussion has focused on direct production material. General-stock replenis
 
 | User/function | Main decisions and responsibilities |
 |---|---|
-| Program/production planning | Explore new builds and changes to work-order quantities or dates; understand readiness and consequences before committing changes. |
+| Program/production planning | Review work-order readiness and production starts; choose priorities when material must be allocated across competing orders. Broad scheduling simulation remains deferred. |
 | Material planning / purchasing | Review coverage, confirm or release remote inventory holds, arrange transfers, buy shortages, consolidate demand, replenish stock, and coordinate expedited handling manually. Treat these as one function for the prototype. |
 | Receiving / warehouse | Anticipate arrivals, receive and count material, manage queues, pick and stage kits, and flag discrepancies. |
 | QA | Record quantities accepted and rejected at a simple QA stage. Accepted quantity becomes available; rejected quantity is scrapped, with source links preserved. |
@@ -50,7 +60,7 @@ For material shortages, the program manager chooses priorities and purchasing ap
 
 ## 4. Core decisions
 
-### 4.1 Work-order finalization triggers inventory reservation
+### 4.1 Work-order finalization allocates inventory
 
 Draft or proposed work orders support planning without changing committed inventory reservations. When a work order is finalized, automatically reserve eligible, unallocated inventory in the warehouse attached to its manufacturing facility.
 
@@ -60,24 +70,24 @@ For unmet demand, the latest selected direction is to **provisionally reserve el
 
 A remote hold must remain visibly distinct from local availability. It does not make the work order ready. The planner needs transfer timing, cost, and competing demand to make the decision. Existing commitments must not be silently taken from another order.
 
-**Selected UI:** remote holds appear in an **Inventory planning queue**: "stock exists at another site; transfer it or buy instead." Each row offers both actions. Releasing a hold returns the requirement to the purchasing queue.
+**Selected UI:** remote allocations appear within **Source material**, labeled “Stock at another site,” alongside local stock, open orders, and purchasing options. “Buy instead” opens the purchase flow for the same requirements; it must not merely release stock and navigate to a general queue. Preserve the remote allocation while the user edits; when the replacement purchase is confirmed, release the replaced quantity and create its new allocation together. Canceling the dialog changes nothing. A deliberate release without replacement remains a separate secondary action.
 
 **Open:** Remote-site selection, hold duration and expiry, ownership, cross-site priority conflicts, and whether remote sites must approve transfers.
 
-### 4.2 A shared planning/purchasing queue supports multiple views
+### 4.2 Consolidate sourcing by part and destination
 
-Support both a work-order view and a consolidated part view over the same underlying requirements.
+The **Source material** queue defaults to one row per part and destination, with affected work orders expandable underneath. Show part/description, destination, preferred supplier if known, quantity short or requiring a source decision, earliest production start, and one primary **Source material** action. Replenishment is a filter/reason within this queue rather than another top-level page. Preserve separate replenishment and work-order quantities.
 
-- **By work order:** What prevents this build from being ready?
-- **By part:** What quantities are needed across builds, and is a combined purchase worthwhile?
+The sourcing panel brings together available-to-allocate local stock, unallocated open PO supply with dates, remote-stock options, and the remaining purchase quantity. Let purchasing choose supply and quantities while seeing which work orders receive them. Do not recommend a new buy as if existing supply did not exist. Do not automatically select a supplier, transfer, or allocation priority beyond the existing finalization rules.
 
-From a work-order line, indicate other demand for that part and allow the buyer to evaluate combining purchases, for example in a modal. Preserve individual quantities, need-by dates, and existing coverage throughout.
+Show supplier, destination, part, quantities, and production dates as explicit context. A supplier may be unknown before buying; label it “Not selected” rather than inventing one. Retain chosen requirements and quantities when switching sourcing options. Clearly show confirmed changes and the remaining short quantity after each action; an uncommitted dialog must not change live allocations.
 
-The queue also distinguishes two reasons for purchasing: a short work-order requirement or replenishment of general inventory. These can contribute to the same purchase when appropriate.
+“By part” and “By work order” are grouping/filter options over the same demand, not independent queues with duplicate purchase actions. Compatible demand may share a purchase, but each requirement keeps its quantity and date. Do not merge sites into a sourcing row or imply that all stock across sites is immediately usable locally.
 
-**Selected UI:** the **Purchasing queue** lists short requirements with their preferred supplier, the quantity short, and any unassigned stock or open PO quantity at the same site that could cover them without buying. Every purchasing screen and dialog shows the supplier.
+**Selected UI — queue split:** a toggle switches between the two groupings; the chosen grouping is kept in the URL so it survives refresh and can be shared.
 
-The by-part view answers one question per part: **can current stock and open orders meet the requirement?** It shows needed, covered, and gap, plus a verdict (covered, at risk, assign existing supply, or short) and the action that closes the gap. Expanding a part lists each work order's requirement and how it is covered, in a single table.
+- **By part number** (default): one row per part and destination site with total short, earliest production start, preferred supplier, and reasons (short, stock at another site, replenishment). Expanding a row lists each affected work order with its created date, production start, and quantity. Source material for the group covers all listed requirements.
+- **By work order:** one row per requirement with work order, **created date**, site, production start, part, supplier, and quantity. It does not list which other work orders are short for the same part; combining demand belongs to the by-part grouping. Source material from this row preselects only this requirement.
 
 ### 4.3 One PO line can support multiple work orders
 
@@ -87,7 +97,7 @@ For example, one purchase of 1,000 units could cover 200 for work order A, 300 f
 
 Receiving records what arrived against the PO. Allocations preserve which demand the supply supports. Partial arrivals and partial QA release must expose which work-order quantities are actually covered and which are still waiting.
 
-**Selected:** Do not automatically prioritize competing work orders after a short receipt or QA rejection. Surface the shortfall as a **material shortage** with its linked work orders to purchasing and the program manager. Use scenario planning to preview and apply a manual allocation decision. Until then, show "decision needed"; do not claim every linked order is individually short or fully covered.
+**Selected:** Do not automatically prioritize competing work orders after a short receipt or QA rejection. Surface the shortfall as a **material shortage** with its linked work orders to purchasing and the program manager. Use scenario planning to preview and apply a manual allocation decision. Until then, show "Allocation decision needed"; do not claim every linked order is individually short or fully covered.
 
 ### 4.4 General inventory can trigger replenishment
 
@@ -105,7 +115,7 @@ Work orders enter with explicit required parts and quantities. Do not calculate 
 
 Show **production start date** on receiving screens, warehouse screens, and their queues. For shared supply, show the linked work orders and their production start dates; an earliest-start summary may be used without implying an allocation priority. Do not add separate receiving, QA, or staging target dates or processing-buffer calculations yet.
 
-Arrival is still distinct from readiness: ordered, in transit, awaiting receipt, and awaiting QA are on order, not available or staged. Compare expected arrival to production start to identify known delivery conflicts. Arrival on or before production start means no known arrival-date conflict, not a guarantee that processing and staging can finish in time. Missing arrival dates mean timing is unknown.
+Arrival is still distinct from readiness: on-order supply, transfers in transit, material awaiting receipt, and material awaiting QA are not available or staged. Display their actual stage rather than collapsing them into “On order.” Compare expected arrival to production start to identify known delivery conflicts. Arrival on or before production start means no known arrival-date conflict, not a guarantee that processing and staging can finish in time. Missing arrival dates mean timing is unknown.
 
 **Deferred until screens are reviewed:** QA duration, receiving turnaround, picking/staging buffers, operational target dates, calendars, and a calculated available/staged forecast.
 
@@ -129,17 +139,17 @@ Use separate linked records for shipment, receiving, QA, and inventory activitie
 
 Every rejection creates a purchasing exception, even if spare supply prevents a work-order shortage. Also show linked work-order impacts when coverage is affected. Purchasing reviews the exception and records manual follow-up. Replacement procurement remains manual.
 
-If 100 units support three work orders and QA accepts 80, show **100 allocated / 80 available — decision needed**. Do not automatically select which order loses 20 units. The 20 scrapped units never count as supply; the material shortage goes to scenario planning. Fine-grained urgent inspection splitting is deferred; separate receipts/QA batches still retain their source links.
+If 100 units support three work orders and QA accepts 80, show **100 allocated / 80 available — allocation decision needed**. Do not automatically select which order loses 20 units. The 20 scrapped units never count as supply; the material shortage goes to scenario planning. Fine-grained urgent inspection splitting is deferred; separate receipts/QA batches still retain their source links.
 
 ### 4.9 Exceptions retain their operational impact
 
 Report short receipts, QA rejection, and picking discrepancies where discovered. Preserve source, affected quantity, owner, linked work orders, production start dates, and review status. Purchasing and the program manager see material shortfalls; warehouse staff record facts without choosing program priority.
 
-Distinguish an unresolved allocation decision from a confirmed shortage on a particular work order. After a plan is applied, show the actual remaining shortages by order. Acknowledging an exception does not create stock, clear a quality hold, or erase a shortage. The exception may be closed when its review/action is recorded, while any unresolved material shortage remains visible independently.
+Distinguish an unresolved allocation decision from a confirmed shortage on a particular work order. After a plan is applied, show the actual remaining shortages by order. Acknowledging an exception does not create stock, reverse scrap, or erase a shortage. The exception may be closed when its review/action is recorded, while any unresolved material shortage remains visible independently.
 
-### 4.10 Scenario planning is limited to material shortages
+### 4.10 Allocate material across competing work orders
 
-For this prototype, use one focused case: a partial receipt or QA rejection leaves insufficient supply across several work orders (a material shortage). Purchasing and the program manager inspect the remaining supply, split it between available and still-on-order quantities per work order, and see which orders remain short alongside production start dates. The scenario screen names the part, PO line, and supplier as separate labeled fields.
+For this prototype, use one focused allocation workspace for a shared shortage or an ambiguous partial receipt. A partial receipt can require choosing who receives accepted stock now even when the remaining incoming supply will cover every order. Only the first case implies a total supply deficit. Purchasing and the program manager inspect the remaining supply, allocate it between available and incoming quantities per work order, retaining separate on-order, transfer, and awaiting-QA detail, and see which orders remain short alongside production start dates. The scenario screen names the part, PO line, supplier, and destination as separate labeled fields. Reuse the same draft for the same decision when reached from different screens; do not create duplicate scenarios on each click.
 
 Changes stay hypothetical until **Apply**. Discard leaves live allocations unchanged. Apply rechecks current supply and requirement quantities, rejects stale or infeasible proposals, and commits the allocation changes together. No automatic earliest-start allocation rule.
 
@@ -184,19 +194,55 @@ A demonstration can simulate a supplier delay, update the affected shipment or u
 
 ### 4.14 Assign existing incoming supply manually
 
-On the manual planning/purchasing screen, show matching incoming PO and transfer supply, quantity not already allocated, destination, and expected arrival. Label it **on order**, not in inventory. The purchaser can assign an available quantity to a work-order item before deciding to buy more. Do not automatically allocate incoming supply or recommend a new buy as if that supply did not exist. Supply arriving after production start may be assigned, but its timing conflict stays visible.
+Within Source material, show matching incoming PO and transfer supply, quantity not already allocated, destination, and expected arrival. Label PO supply **On order** and transfers **Transfer in transit**, not available stock. The purchaser can assign an unallocated quantity to a work-order item before deciding to buy more. Do not automatically allocate incoming supply or recommend a new buy as if that supply did not exist. Supply arriving after production start may be assigned, but its timing conflict stays visible.
 
 ### 4.15 Purchase order check-in tasks
 
 Purchasing can add an optional **purchase order check-in task**, with due date, owner, and short note. For example, November 23 is the check-in date for a December 1 delivery. These are separate dates and records.
 
-The purchasing queue shows the next open check-in date and highlights due/overdue tasks with a link to the PO. Completing a check-in records an outcome and may update expected arrival. An overdue check-in means follow-up is needed; it does not by itself mean the material is late. A check-in finding a later arrival triggers the work-order impact rules above.
+The Supplier follow-up queue shows the next open check-in date and highlights due/overdue tasks with a link to the PO. Completing a check-in records an outcome and may update expected arrival. An overdue check-in means follow-up is needed; it does not by itself mean the material is late. A check-in finding a later arrival triggers the work-order impact rules above.
 
 Supplier-capacity concerns are handled through purchaser judgment, notes, and these tasks. Do not add supplier-level confirmation-required settings, confidence scoring, or modeled capacity constraints.
 
 ### 4.16 Consolidation is the logistics-cost scope
 
 Flag other compatible demand as an opportunity to combine purchases into one PO. Show quantities, supplier/destination compatibility, and affected production start dates so purchasing can judge timing. Preserve each work-order allocation. This is a decision aid for potential savings, not a freight-price calculation or a claim that every combined purchase reduces shipping cost. Detailed freight optimization is deferred.
+
+### 4.17 Navigation follows decisions
+
+Purchasing has three primary work queues:
+
+| Queue | Contents | Primary operation |
+|---|---|---|
+| **Source material** | Short requirements, remote-stock decisions, replenishment | Assign stock/incoming supply, arrange transfer, or purchase |
+| **Supplier follow-up** | Due check-ins, missing/late supplier arrivals, PO reviews | Record supplier update and follow-up outcome |
+| **Allocate material** | Shared shortages and accepted receipts needing allocation decisions | Preview and apply allocations across work orders |
+
+Purchase orders, Work orders, and Inventory are reference views. Program management sees Work orders and the same Allocate material workspace. Warehouse and QA retain task-specific views appropriate to physical work; do not merge separate physical confirmations merely to reduce clicks.
+
+Consolidate related alerts under their source decision. A PO check-in and a late shipment can appear as reasons on one follow-up item, retaining shipment-level updates and task identities. A QA rejection and its allocation deficit open the same allocation decision with issue context. Counts represent actionable items, not the sum of duplicate alerts. Independent decisions may still appear separately.
+
+Filter by site, supplier, work order, and issue type where useful. A filter or alternate grouping does not need its own top-level sidebar destination. Use specific issue labels; keep a full exception/history register as a secondary reference if needed.
+
+### 4.18 Complete actions in context
+
+Every primary action opens the relevant record/task with part, source, destination, requirement, and quantity preselected where known. No generic “Open exception,” unfiltered pick-list redirect, or arrival dialog that asks the user to re-identify the source they just selected.
+
+Record supplier update supports an outcome note, optional expected-arrival changes for selected shipment/PO lines, completion of the relevant check-in, and an optional next check-in. These changes belong in one interaction. Show affected production starts and remaining conflicts; do not imply that recording a later date resolves lateness. External supplier negotiation remains manual.
+
+Exception follow-up is captured alongside the operational action. Acknowledge is not a mandatory separate click. Record links to the applied allocation, replacement purchase, or follow-up. Close only the issue review actually completed; unresolved shortages and independent blockers stay visible. Reject and scrap remains irreversible within this prototype’s ordinary workflow.
+
+After confirmation, refresh affected work-order, PO, inventory, task, and queue summaries. Show what changed and what remains to do. Cancel/Discard leaves uncommitted changes untouched. Consolidated interactions must preserve atomic quantity updates and manual priority decisions.
+
+### 4.19 Screen hierarchy and information density
+
+**Work-order detail:** compact header with order identity, program, site, production start, build quantity, and kit/schedule summary. Use one requirements table: Part (with description), Needed, Current situation, Next action. Provide Attention needed / All requirements filtering. Do not repeat the same requirements in a second “What needs to happen” action table. Expand a row for allocations, shipment/QA details, secondary issues, and history. Hide empty fixture/exception panels; move Reduce requirement and Cancel order into secondary menus. Show fixture review only when relevant.
+
+**PO detail:** default line table uses Part, Ordered, Received, Next arrival, Issue, Action. Expand one selected line for shipment, allocation, QA, and quantity breakdowns. Do not expand every line by default. Show a concise “Multiple arrivals” summary where one date would mislead. Completed check-ins/history are secondary. Supplier simulation belongs in demo controls, not the normal purchasing action area.
+
+**Allocation workspace:** show part/source/supplier/site, remaining available and incoming supply, and a work-order allocation table with production starts and proposed outcome. Keep Preview and Apply together. Omit empty source columns (for example incoming when none exists). Retain stale-state warnings and both live and proposed consequences without repeating the same totals in several cards.
+
+Use brief factual labels and operational quantities. Put rule explanations in help/detail only when useful. Avoid decorative coverage bars, repeated colored badges, raw JSON history, and paragraphs repeating the table. One primary action may open several legitimate options; it must not hide mixed shortages or force an artificial one-state model.
 
 ## 5. Data model and quantity rules
 
@@ -210,7 +256,7 @@ All records have stable IDs. Mutable records carry `updated_at`; records changed
 |---|---|
 | Part | `id`, `part_number`, description, unit of measure, `requires_qa`; optional traceability/replenishment settings. Fixtures remain a separate requirement type. |
 | Warehouse | `id`, name, facility reference. Inventory is location-specific, never just a global part-number balance. |
-| WorkOrder | `id`, program, facility/warehouse, `production_start_date`, state (`draft`, `finalized`, `canceled`). |
+| WorkOrder | `id`, program, facility/warehouse, `production_start_date`, state (`draft`, `finalized`, `canceled`), `created_at` (when the upstream work order was created; shown in queues and work-order views). |
 | WorkOrderItem | `id`, `work_order_id`, `part_id`, `required_qty`; explicit upstream requirement. References to an item distinguish repeated part lines. |
 | Supplier / PurchaseOrder | Supplier identity; PO `id`, `supplier_id`, destination warehouse, status, buyer. |
 | PurchaseOrderLine | `id`, `po_id`, `part_id`, ordered/canceled quantities, expected arrival for unshipped quantity, date source and update time. Unallocated remainder can cover general stock. |
@@ -231,9 +277,9 @@ One work-order item can have many allocations, and one supply source can have ma
 
 **Proposed handoff rule:** When accepted receipt quantities become inventory, move the corresponding allocation quantity from the PO line to the new inventory record in the same transaction. Preserve the PO lineage and a handoff/history reference. Reduce or release the predecessor allocation; do not leave both active for the same units. Partial handoffs split allocation quantities.
 
-If the remaining supply is insufficient for all allocations, do not choose winners during this handoff. Mark it as a material shortage with the linked work orders as "decision needed", block affected quantities from picking, and let scenario Apply assign available inventory and any remaining on-order supply. Existing allocations remain visible as demand, not additional stock. Scrapped quantities can never back allocations. After Apply, any demand without a valid source is explicitly short.
+If the remaining supply is insufficient for all allocations, do not choose winners during this handoff. Mark it as a material shortage with the linked work orders as "Allocation decision needed", block affected quantities from picking, and let scenario Apply assign available inventory and any remaining incoming supply, with its actual stage shown. Existing allocations remain visible as demand, not additional stock. Scrapped quantities can never back allocations. After Apply, any demand without a valid source is explicitly short.
 
-For a normal partial receipt with enough remaining on-order quantity to honor all allocations, preserve the allocations. Any choice about which order receives the now-available subset is manual if ambiguous (a **receipt handoff**); a partial shipment alone need not mean a material shortage.
+For a normal partial receipt with enough remaining on-order quantity to honor all allocations, preserve the allocations. Any choice about which order receives the now-available subset is manual if ambiguous through **Assign received material** in the Allocate material workspace; a partial shipment alone need not mean a material shortage.
 
 Transfers follow the same conservation rule: source stock reserved for transfer cannot also cover a local order; receipt at destination retires the corresponding in-transit quantity and establishes destination inventory once. For the prototype, manually seeded/updated transfer records are sufficient.
 
@@ -247,37 +293,53 @@ Transfers follow the same conservation rule: source stock reserved for transfer 
 - Only unused allocations are automatically released for demand reduction/cancellation. Picked/staged material is not made available by an administrative release.
 - Posting a receipt, QA outcome, handoff, or scenario twice must not double the quantity. Use operation IDs or equivalent duplicate-submit protection. This does not require production-grade supplier integration event handling.
 
-### 5.4 Derived views, not one overloaded status
+### 5.4 Derived facts and operator summaries
 
-For each work-order item, calculate required, on-order allocated, available allocated, staged (a subset of available), short, and decision-needed quantities. Do not add staged to available when calculating coverage.
+Calculate required quantity, allocated incoming quantity by stage, allocated available quantity, staged quantity, short quantity, and allocation-review state. Staged is a subset of available, not additional supply. Disputed commitments are not fully allocated coverage. Preserve this detail behind the summary; do not render a separate default column for every internal quantity bucket.
 
-Screens should not show every one of these quantities as its own column. Each requirement gets **one status** with its key quantity and date, plus **one next action**. Status, in precedence order:
+Each requirement has one **primary situation** and one **primary action**, with secondary issues visible on expansion. Default situation precedence is allocation decision, confirmed short quantity, remote transfer decision, late arrival, unknown arrival, awaiting receipt, awaiting QA, remaining incoming supply, ready to stage, staged. Precedence selects the summary, not which facts exist or who gets stock. A confirmed short quantity independent of a disputed allocation must remain visible in detail.
 
-| Status | Shown as | Next action |
-|---|---|---|
-| Short | "Short 20" | Buy (or assign unassigned supply at the site) |
-| Decision needed | "Shortage: decision needed" | Resolve the material shortage |
-| Transfer decision | "Stock at another site" | Transfer or buy instead |
-| Arrives late | "Arrives Dec 5 — after start" | Update the arrival / follow up with the supplier |
-| Arrival unknown | "Arrival date unknown" | Get a date from the supplier |
-| On order | "Arriving Dec 2" | None; waiting |
-| Ready to stage | "Available — not staged" | Pick and stage |
-| Staged | "Staged" | None |
+| Situation example | Primary action / behavior |
+|---|---|
+| Allocation decision needed | Allocate material; open the specific shared source/draft |
+| Short 20 | Source material; preselect the requirement and destination |
+| Stock at another site | Source material; show transfer and purchase options |
+| 20 arrive Dec 5 — start Dec 3 | Record supplier update; preselect the shipment/PO line |
+| Arrival date unknown | Record supplier update for the specific incoming source |
+| Arrived — awaiting receipt | Open the specific receiving task |
+| 40 awaiting QA | Open the specific QA task; do not request a supplier ETA |
+| 60 on order — arriving Dec 2 | No mandatory action; scheduled follow-up remains independently visible |
+| Transfer in transit — arriving Dec 2 | View transfer; supplier follow-up is not implied |
+| Available — not staged | Open this order’s pick/stage tasks |
+| Staged | No action |
 
-Each work order rolls these up into an **outlook** (Ready, On track, At risk, Action needed) and a list of next actions. Every next action is a button on the work-order screen. Work-order screens list program, site, production start, build quantity, and state as separate labeled fields, not a combined subheading.
+Already received quantities do not remain late or unknown because of an obsolete arrival estimate. They can still be unready because receipt, QA, or staging is incomplete. For mixed supplies, retain quantities, dates, stages, and affected requirements in expanded detail. If shipment attribution is undecided, explicitly show timing review rather than inventing a precise order-level arrival.
 
-Show timing separately: expected arrival versus production start, unknown arrival, and any known late quantity. For multiple shipments, retain quantities/dates and identify which source is assigned to which requirement; if the split has not been decided, show shared timing review rather than inventing an order-level ETA. A PO allocation may retain shipment-level quantity links for this purpose without duplicating its quantity.
+**Work-order summary:** show Kit ready when all material is accepted/staged, all blocking issues or allocation decisions are resolved, and manual fixture coverage is recorded. Otherwise show a separate schedule outlook and outstanding actions. Use these prototype rules:
 
-A work order is **ready** only when all component requirements are accepted and staged, no blocking exception or undecided material shortage remains, and required manual fixture coverage is recorded. Fixture scheduling is still unverified. “Incoming coverage” is not “ready.” Do not calculate a buffered readiness date in this iteration.
+- **At risk:** a known late incoming quantity, confirmed shortage, unresolved shared allocation, blocking material issue, unconfirmed required fixture coverage, or an incomplete kit at/past production start.
+- **Unknown:** no known At risk condition, but a required incoming arrival or transfer timing is unknown/unconfirmed.
+- **On track:** no known risk/unknown condition; valid allocations exist and known incoming dates meet production start. Receiving, QA, or staging may still be pending. This is not a processing-time forecast or guarantee.
+
+At risk takes precedence over Unknown, which takes precedence over On track. Draft and canceled work orders show their lifecycle state rather than a readiness forecast. “Action needed” is a task indicator, not a competing schedule-outlook category. An overdue check-in alone does not imply late material or an At risk work order.
+
+No receiving/QA/staging buffers or predicted readiness dates are added. The model still records physical state and process tasks even when schedule outlook is On track.
 
 ### 5.5 Concrete acceptance examples
 
-1. **Shared QA rejection:** A/B/C require 40/30/30 of the same part. A 100-unit receipt yields 80 accepted and 20 scrapped. Show 100 allocated / 80 available and "decision needed"; no automatic losing order. A draft 40/30/10 plan leaves C short 20 only in preview. Apply commits that outcome; available allocations sum to 80, the 20 scrapped units never return to supply, and repeating Apply does not duplicate stock.
+1. **Shared QA rejection:** A/B/C require 40/30/30 of the same part. A 100-unit receipt yields 80 accepted and 20 scrapped. Show 100 allocated / 80 available and "Allocation decision needed"; no automatic losing order. A draft 40/30/10 plan leaves C short 20 only in preview. Apply commits that outcome; available allocations sum to 80, the 20 scrapped units never return to supply, and repeating Apply does not duplicate stock.
 2. **PO check-in:** A November 23 task concerns a December 1 arrival. An overdue task highlights follow-up only. Updating arrival to December 5 flags a linked December 3 work order while leaving its production start unchanged.
 3. **Incoming assignment:** A PO line has 100 units, 70 already assigned. Planning exposes 30 unallocated; assigning 20 leaves 10, and the demand is marked on order rather than ready.
 4. **Stage conservation:** Receiving 40 of 100 leaves 60 outstanding. Accepting the 40 yields 40 available, not 140. Staging those 40 changes stage only. Accepted inventory and the remaining PO quantities cannot both claim the same 40 units.
 5. **Cancellation:** Canceling an order releases its unused stock/PO commitments, flags the PO for review, and does not cancel the supplier order or release already staged material.
 6. **Stale scenario:** If QA or allocations change after preview, Apply requires refresh/review and makes no partial changes.
+
+
+7. **Context preservation:** Buy instead opens the purchase flow for the selected remote allocation; canceling changes nothing. Confirmation replaces only the selected quantity. Pick/QA/receipt actions open the specific task or an order-filtered task list, not a general queue.
+8. **Mixed condition:** A requirement can be short 20 and have another 30 arriving late. The primary situation follows precedence; expanded detail shows both, with each relevant action. The short quantity is not silently removed when an arrival is updated.
+9. **Received material:** Accepted or pending-QA receipt quantities are not labeled Arriving and do not ask for supplier dates. QA rejection scraps stock and opens the appropriate source/allocation issue without a quality-hold workflow.
+10. **Consolidated follow-up:** A due check-in and late shipment on the same PO can be handled in one update interaction. Completing the task does not remove an unresolved delivery conflict.
+11. **No duplicate work:** A work-order requirement has one action-bearing row. Related exception context opens the same operational decision; independent blockers remain visible after that decision is completed.
 
 ## 6. Trade-offs explored
 
@@ -308,9 +370,9 @@ Likewise, lot tracking is a discussed requirement for parts that need traceabili
 
 ## 8. Selected scope and deferred decisions
 
-**Selected prototype behaviors:** Complete-kit readiness per upstream work order with an outlook and next action; local reservations and provisional remote holds (inventory planning queue); manual assignment of incoming supply; purchasing queue and by-part coverage view with suppliers and consolidation opportunities; manual/simulated arrival updates; PO check-in tasks; receiving and minimal accepted/scrapped QA; material-shortage visibility for purchasing/program management; manual allocation scenario with explicit Apply; picking/staging; unused-allocation release and PO review on cancellation/reduction.
+**Selected prototype behaviors:** Complete-kit readiness per upstream work order with a kit/schedule summary and next action; local allocations and provisional remote allocations within Source material; manual assignment of incoming supply; consolidated sourcing by part/destination with suppliers and work-order detail; manual/simulated arrival updates; PO check-in tasks; receiving and minimal accepted/scrapped QA; material-shortage visibility for purchasing/program management; manual allocation scenario with explicit Apply; picking/staging; unused-allocation release and PO review on cancellation/reduction.
 
-**Screen principles:** one purpose per screen, reached from a side menu; tables rather than prose; one status and one next action per row instead of a column per quantity bucket; no decorative coverage bars; key facts (program, site, part, supplier, dates) as labeled fields; every next action reachable by a button on the screen where the problem is shown.
+**Screen principles:** organize queues around the three decisions in §4.17, preserve action context (§4.18), and use progressive detail (§4.19). One primary situation/action summarizes each requirement without suppressing other facts. No duplicate action table or top-level page for every condition.
 
 These decisions define behavior, not a requirement to polish every screen. The suggested connected demonstration is purchasing assigns supply → receiving records arrival → QA rejects part of a shared receipt → purchasing/program management review and apply allocations → remaining shortages stay visible. This demonstration sequence is an AI suggestion for Kyle to select, not a claim of completed validation.
 
@@ -322,7 +384,7 @@ Remaining validation questions, not requests to expand the build:
 
 - Which existing systems own work orders, inventory, quality release, and allocations in a real implementation?
 - What remote-hold selection/expiry rules and replenishment formulas are needed? These earlier concept details remain open; do not add optimization implicitly.
-- What revision, approved-source, lot/documentation, and substitution rules make inventory eligible? For seeded prototype data, assume exact part matches and explicitly acceptable inventory except demonstrated quality holds.
+- What revision, approved-source, lot/documentation, and substitution rules make inventory eligible? For seeded prototype data, assume exact part matches and explicitly acceptable inventory except demonstrated pending QA or scrap.
 - ~~Is a simple externally authorized use-as-is record useful?~~ Resolved: rejected material is scrapped; there is no hold or use-as-is state.
 - Do real users need processing buffers after reviewing the initial queues? Keep that as a follow-on review item.
 - Which assumptions will Kyle test, and which actions/screens best communicate his chosen scope within the interview?
@@ -348,6 +410,6 @@ Candidate outcome measures are the share of kits staged by their need-by time, a
 
 - **ArsenalOS PM Interview Prompt (v2 – Candidate):** Authoritative assignment scope and evaluation guidance; supplied PDF.
 - **Anduril MDP Senior PM Research and Take-Home Context:** Supporting role background; supplied Markdown dossier. Its statement that the exact prompt was unavailable is superseded by the supplied prompt.
-- **Planning discussion supplied in this conversation:** Source of the decisions and trade-offs recorded here. The latest discussion narrows QA, scenario planning, timing, and recovery; it adds manual incoming allocation and PO check-in tasks. Data-model mechanics marked proposed are AI-assisted implementation recommendations.
+- **Planning discussion supplied in this conversation:** Source of the decisions and trade-offs recorded here. The latest discussion establishes consistent operator terminology and consolidates sourcing, supplier follow-up, and allocation decisions. The source review identified duplicate work-order actions, context-losing links, and excessive default quantity detail; this revision specifies the next iteration, not completed implementation. Data-model mechanics marked proposed are AI-assisted implementation recommendations.
 
 This document organizes the discussion with AI assistance. It does not establish that its assumptions have been tested, nor replace Kyle’s own process narrative about research, judgment, AI usage, and implementation choices.

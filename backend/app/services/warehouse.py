@@ -283,7 +283,7 @@ def pick(db: Session, actor: Actor, allocation_id: str, qty: int, location: str,
     if alloc.state != "committed" or not alloc.inventory_record_id:
         raise DomainError("Only committed inventory allocations can be picked")
     if alloc.review_required:
-        raise DomainError("Allocation review required before picking")
+        raise DomainError("An allocation decision is needed before picking")
     item = get_or_404(db, WorkOrderItem, alloc.work_order_item_id)
     wo = get_or_404(db, WorkOrder, item.work_order_id)
     if wo.state != "finalized":
