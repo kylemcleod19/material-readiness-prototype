@@ -1,0 +1,47 @@
+name: readiness
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: readiness
+      POSTGRES_PASSWORD: readiness
+      POSTGRES_DB: readiness
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U readiness -d readiness"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://readiness:readiness@db:5432/readiness
+      TEST_DATABASE_URL: postgresql://readiness:readiness@db:5432/readiness_test
+      DEMO_TODAY: "2026-11-24"
+      DEMO_RESET_ENABLED: "true"
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: ["sh", "/app/start.sh", "--reload"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    environment:
+      API_UPSTREAM: http://api:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
